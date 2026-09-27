@@ -216,9 +216,11 @@ Instead, it performs a non-destructive interrupted-state inspection of the Windo
 - reports whether a retained `WinRE-Relayout-Backup-*` image is available;
 - when exactly one Recovery partition exists, checks whether it is immediately after `C:` and is the last partition on disk.
 
-If that single Recovery candidate matches the expected final placement, the script directs the user to **WinRE confirmation / recovery** (option 3) and exits without making changes. Execute is deliberately blocked until WinRE has been repaired/confirmed.
+If that single Recovery candidate matches the expected final placement **and is large enough for the retained Winre.wim plus the Windows 11 minimum 200 MB free space**, the script directs the user to **WinRE confirmation / recovery** (option 3) and exits without making changes.
 
-If there is no Recovery partition, more than one candidate, or unexpected partition geometry, the script stops cleanly, prints the current partition layout, and tells the user not to run Execute. Option 3 remains non-destructive and does not create or resize partitions.
+If the single Recovery candidate is correctly placed but too small for the retained Winre.wim, Dry run can instead evaluate an **interrupted WinRE recovery relayout**. That path reuses the retained Winre.wim backup and can recreate the existing Recovery partition at a compliant selected size. It still requires the same explicit `RELAYOUT` confirmation and rollback protections as normal Execute. If BitLocker is encrypted but has no configured key protectors, Execute is blocked before confirmation until the BitLocker protector configuration is repaired.
+
+If there is no Recovery partition, more than one candidate, no usable Winre.wim source, or unexpected partition geometry, the script stops cleanly and does not attempt partition changes. Option 3 remains non-destructive and does not create or resize partitions.
 
 The interrupted-state gate returns exit code `2`; the BAT launcher labels that code as recovery/confirmation required instead of presenting it as a successful Execute.
 

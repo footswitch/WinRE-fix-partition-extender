@@ -199,7 +199,7 @@ function Get-WinRELocation {
     }
 }
 
-function Write-InterruptedWinREGuidance {
+function Get-InterruptedWinREState {
     param(
         [Parameter(Mandatory)] [int]$DiskNumber,
         [Parameter(Mandatory)] [char]$OsLetter
@@ -226,72 +226,114 @@ function Write-InterruptedWinREGuidance {
         }
     }
 
-    Write-Host ''
-    Write-Host 'WINRE IS DISABLED - RELAYOUT IS NOT SAFE TO START' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host 'This usually means a previous WinRE operation was interrupted or is still awaiting recovery/confirmation.'
-    Write-Host 'Dry run will not guess an active WinRE partition, and Execute must not start another relayout in this state.'
-    Write-Host ''
-    Write-Host ("Windows disk:              {0}" -f $DiskNumber)
-    Write-Host ("Recovery GPT candidates:   {0}" -f $recoveryCandidates.Count)
-    Write-Host ("Staged Winre.wim present:  {0}" -f $(if ($stagedWimPresent) { 'Yes' } else { 'No' }))
-    Write-Host ("Relayout backup present:   {0}" -f $(if ($null -ne $backupWim) { 'Yes' } else { 'No' }))
-    if ($null -ne $backupWim) {
-        Write-Host ("Newest usable backup:      {0}" -f $backupWim)
+    $sourceWimPath = if ($null -ne $backupWim) { $backupWim } elseif ($stagedWimPresent) { $stagedWimPath } else { $null }
+    $sourceWimItem = $null
+    $requiredRecoveryBytes = $null
+    if ($null -ne $sourceWimPath) {
+        $sourceWimItem = Get-Item -LiteralPath $sourceWimPath -Force -ErrorAction Stop
+        $requiredRecoveryBytes = Round-Up -Value ([uint64]$sourceWimItem.Length + 200MB) -Multiple 1MB
     }
 
+    $candidate = $null
+    $candidateImmediatelyAfterOS = $false
+    $candidateLast = $false
     if ($recoveryCandidates.Count -eq 1) {
         $candidate = $recoveryCandidates[0]
         $nextAfterOS = @($partitions | Where-Object { $_.Offset -gt $osPartition.Offset } | Select-Object -First 1)
         $afterCandidate = @($partitions | Where-Object { $_.Offset -gt $candidate.Offset })
-        $candidateImmediatelyAfterOS = (
-            ($nextAfterOS.Count -eq 1) -and
-            ($nextAfterOS[0].PartitionNumber -eq $candidate.PartitionNumber)
-        )
+        $candidateImmediatelyAfterOS = (($nextAfterOS.Count -eq 1) -and ($nextAfterOS[0].PartitionNumber -eq $candidate.PartitionNumber))
         $candidateLast = $afterCandidate.Count -eq 0
-        $candidateSizeMB = [math]::Round($candidate.Size / 1MB, 0)
+    }
 
+    $usableCandidate = (($null -ne $candidate) -and $candidateImmediatelyAfterOS -and $candidateLast -and ($null -ne $sourceWimItem))
+    $candidateMeetsMinimum = ($usableCandidate -and ([uint64]$candidate.Size -ge [uint64]$requiredRecoveryBytes))
+
+    return [pscustomobject]@{
+        Partitions                  = $partitions
+        RecoveryCandidateCount      = $recoveryCandidates.Count
+        RecoveryPartition           = $candidate
+        CandidateImmediatelyAfterOS = $candidateImmediatelyAfterOS
+        CandidateLast               = $candidateLast
+        StagedWimPresent             = $stagedWimPresent
+        BackupWimPath                = $backupWim
+        SourceWimPath                = $sourceWimPath
+        SourceWimSize                = if ($null -ne $sourceWimItem) { [uint64]$sourceWimItem.Length } else { $null }
+        RequiredRecoveryBytes        = $requiredRecoveryBytes
+        UsableCandidate              = $usableCandidate
+        CandidateMeetsMinimum        = $candidateMeetsMinimum
+    }
+}
+
+function Write-InterruptedWinREGuidance {
+    param(
+        [Parameter(Mandatory)] $State,
+        [Parameter(Mandatory)] [int]$DiskNumber
+    )
+
+    Write-Host ''
+    Write-Host 'WINRE IS DISABLED - INTERRUPTED STATE DETECTED' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'This usually means a previous WinRE operation was interrupted or is still awaiting recovery/confirmation.'
+    Write-Host 'The script will not guess an active WinRE registration.'
+    Write-Host ''
+    Write-Host ("Windows disk:              {0}" -f $DiskNumber)
+    Write-Host ("Recovery GPT candidates:   {0}" -f $State.RecoveryCandidateCount)
+    Write-Host ("Staged Winre.wim present:  {0}" -f $(if ($State.StagedWimPresent) { 'Yes' } else { 'No' }))
+    Write-Host ("Relayout backup present:   {0}" -f $(if ($null -ne $State.BackupWimPath) { 'Yes' } else { 'No' }))
+    if ($null -ne $State.BackupWimPath) {
+        Write-Host ("Newest usable backup:      {0}" -f $State.BackupWimPath)
+    }
+    if ($null -ne $State.SourceWimPath) {
+        Write-Host ("Selected Winre.wim source: {0}" -f $State.SourceWimPath)
+        Write-Host ("Winre.wim size:            {0}" -f (Format-Bytes $State.SourceWimSize))
+        Write-Host ("Minimum Recovery size:     {0}" -f (Format-Bytes $State.RequiredRecoveryBytes))
+    }
+
+    if ($null -ne $State.RecoveryPartition) {
+        $candidate = $State.RecoveryPartition
         Write-Host ''
         Write-Host 'Detected Recovery candidate:' -ForegroundColor Cyan
         Write-Host ("  Partition:               {0}" -f $candidate.PartitionNumber)
-        Write-Host ("  Size:                    {0} MB" -f $candidateSizeMB)
-        Write-Host ("  Immediately after C:     {0}" -f $(if ($candidateImmediatelyAfterOS) { 'Yes' } else { 'No' }))
-        Write-Host ("  Last partition on disk:  {0}" -f $(if ($candidateLast) { 'Yes' } else { 'No' }))
-
-        if ($candidateImmediatelyAfterOS -and $candidateLast) {
-            Write-Host ''
-            Write-Host 'RECOMMENDED NEXT STEP:' -ForegroundColor Green
-            Write-Host '  Run Move-WinRE-And-Extend.bat and choose:'
-            Write-Host '  [3] WinRE confirmation / recovery'
-            Write-Host ''
-            Write-Host 'Option 3 is the intended non-destructive recovery path for this state.'
-            Write-Host 'Do NOT run Execute again before option 3 has repaired/confirmed WinRE.'
-            Write-Host 'If option 3 applies a repair, reboot and run option 3 again until it reports:'
-            Write-Host '  FINAL DISK / WINRE STATE CONFIRMED'
-            return
-        }
-
-        Write-Warning 'A Recovery GPT partition exists, but its placement does not match the expected final layout.'
-        Write-Warning 'Do not run Execute. Option 3 cannot repair partition geometry.'
+        Write-Host ("  Size:                    {0}" -f (Format-Bytes $candidate.Size))
+        Write-Host ("  Immediately after C:     {0}" -f $(if ($State.CandidateImmediatelyAfterOS) { 'Yes' } else { 'No' }))
+        Write-Host ("  Last partition on disk:  {0}" -f $(if ($State.CandidateLast) { 'Yes' } else { 'No' }))
     }
-    elseif ($recoveryCandidates.Count -eq 0) {
+
+    if ($State.CandidateMeetsMinimum) {
+        Write-Host ''
+        Write-Host 'RECOMMENDED NEXT STEP:' -ForegroundColor Green
+        Write-Host '  Choose [3] WinRE confirmation / recovery.'
+        Write-Host 'The existing Recovery partition is large enough, so partition changes are not needed.'
+        return
+    }
+
+    if ($State.UsableCandidate) {
+        Write-Host ''
+        Write-Warning 'The existing Recovery partition is too small for this Winre.wim under the Windows 11 minimum free-space requirement.'
+        Write-Warning 'Option 3 cannot resize partitions.'
+        Write-Host 'Dry run can evaluate an interrupted-relayout repair using the retained Winre.wim backup.' -ForegroundColor Yellow
+        return
+    }
+
+    if ($State.RecoveryCandidateCount -eq 0) {
         Write-Warning 'No Microsoft Recovery GPT partition exists on the Windows disk.'
-        Write-Warning 'The existing option 3 recovery path cannot recreate a missing partition.'
-        Write-Warning 'Do not run Execute. Inspect the partition layout and retained WinRE backup before further partition changes.'
     }
-    else {
+    elseif ($State.RecoveryCandidateCount -gt 1) {
         Write-Warning 'More than one Microsoft Recovery GPT partition exists on the Windows disk.'
-        Write-Warning 'The script will not guess which partition is the correct recovery target.'
-        Write-Warning 'Do not run Execute. Inspect the partition layout before further partition changes.'
     }
-
+    elseif (-not $State.CandidateImmediatelyAfterOS -or -not $State.CandidateLast) {
+        Write-Warning 'The Recovery GPT partition placement does not match the supported layout.'
+    }
+    if ($null -eq $State.SourceWimPath) {
+        Write-Warning 'No staged or retained Winre.wim source is available.'
+    }
+    Write-Warning 'The script will not attempt partition changes in this state.'
     Write-Host ''
     Write-Host 'Current partition layout:' -ForegroundColor Cyan
-    $partitions |
+    $State.Partitions |
         Select-Object PartitionNumber, DriveLetter, Offset, Size, GptType, IsHidden, NoDefaultDriveLetter |
         Format-Table -AutoSize
 }
-
 function Get-BitLockerState {
     param([char]$DriveLetter)
 
@@ -1035,30 +1077,54 @@ if ($reAgentInfo.ExitCode -ne 0) {
 }
 
 $winreEnabled = $reAgentInfo.Output -match '(?im)Windows RE status:\s*Enabled'
+$interruptedRelayout = $false
+$interruptedWimPath = $null
+$interruptedWimSize = $null
+
 if (-not $winreEnabled) {
-    Write-InterruptedWinREGuidance -DiskNumber $disk.Number -OsLetter $osLetter
-    Write-Host ''
-    Write-Host 'No changes were made.' -ForegroundColor Yellow
-    exit 2
+    $interruptedState = Get-InterruptedWinREState -DiskNumber $disk.Number -OsLetter $osLetter
+    Write-InterruptedWinREGuidance -State $interruptedState -DiskNumber $disk.Number
+
+    if (-not $interruptedState.UsableCandidate) {
+        Write-Host ''
+        Write-Host 'No changes were made.' -ForegroundColor Yellow
+        exit 2
+    }
+
+    if ($interruptedState.CandidateMeetsMinimum) {
+        Write-Host ''
+        Write-Host 'No changes were made. Use option 3 instead of Execute.' -ForegroundColor Yellow
+        exit 2
+    }
+
+    $interruptedRelayout = $true
+    $interruptedWimPath = $interruptedState.SourceWimPath
+    $interruptedWimSize = [uint64]$interruptedState.SourceWimSize
+    $recoveryPartition = $interruptedState.RecoveryPartition
+    $winre = [pscustomobject]@{
+        DiskNumber      = $disk.Number
+        PartitionNumber = $recoveryPartition.PartitionNumber
+        RawInfo         = $reAgentInfo.Output
+    }
 }
+else {
+    $winre = Get-WinRELocation -InfoOutput $reAgentInfo.Output
+    if ($null -eq $winre) {
+        Write-Warning 'REAgentC reports WinRE as Enabled, but no WinRE partition location could be parsed.'
+        Write-Warning 'The script will not guess a partition. Do not run Execute until the WinRE state has been inspected.'
+        Write-Host ''
+        Write-Host 'No changes were made.' -ForegroundColor Yellow
+        exit 2
+    }
 
-$winre = Get-WinRELocation -InfoOutput $reAgentInfo.Output
-if ($null -eq $winre) {
-    Write-Warning 'REAgentC reports WinRE as Enabled, but no WinRE partition location could be parsed.'
-    Write-Warning 'The script will not guess a partition. Do not run Execute until the WinRE state has been inspected.'
-    Write-Host ''
-    Write-Host 'No changes were made.' -ForegroundColor Yellow
-    exit 2
+    if ($winre.DiskNumber -ne $osPartition.DiskNumber) {
+        throw "WinRE is on disk $($winre.DiskNumber), but Windows is on disk $($osPartition.DiskNumber). Refusing to continue."
+    }
+
+    $recoveryPartition = Get-Partition `
+        -DiskNumber $winre.DiskNumber `
+        -PartitionNumber $winre.PartitionNumber
 }
-
-if ($winre.DiskNumber -ne $osPartition.DiskNumber) {
-    throw "WinRE is on disk $($winre.DiskNumber), but Windows is on disk $($osPartition.DiskNumber). Refusing to continue."
-}
-
-$recoveryPartition = Get-Partition `
-    -DiskNumber $winre.DiskNumber `
-    -PartitionNumber $winre.PartitionNumber
-
 $actualType = "$($recoveryPartition.GptType)".Trim('{}').ToLowerInvariant()
 if ($actualType -ne $RecoveryGptTypeBare) {
     throw "The partition registered as WinRE does not have Microsoft's Recovery GPT type. Found: $($recoveryPartition.GptType)"
@@ -1090,6 +1156,15 @@ $bitLockerPreflight = Get-BitLockerState -DriveLetter $osLetter
 Write-BitLockerState -State $bitLockerPreflight -Prefix 'BitLocker preflight'
 
 $requestedRecoveryBytes = [uint64]$RecoverySizeMB * $MiB
+
+if ($interruptedRelayout) {
+    $interruptedMinimumRecoveryBytes = Round-Up -Value ($interruptedWimSize + 200MB) -Multiple 1MB
+    if ($requestedRecoveryBytes -lt $interruptedMinimumRecoveryBytes) {
+        Write-Warning ("Selected Recovery size ({0} MB) is too small for the retained Winre.wim. Select at least approximately {1} MB." -f $RecoverySizeMB, [math]::Ceiling($interruptedMinimumRecoveryBytes / 1MB))
+        Write-Host 'No changes were made.' -ForegroundColor Yellow
+        exit 2
+    }
+}
 
 # Before any WinRE or BitLocker state is changed, make sure the OS volume has
 # enough room for both the temporary WinRE staging copy created by /disable and
@@ -1126,7 +1201,9 @@ $meaningfulTailFree = $tailFree -ge 64MB
 $downsizingOnly = (-not $meaningfulTailFree) -and ($estimatedDelta -gt 0)
 $lowGain = ($estimatedDelta -gt 0) -and ($estimatedDelta -lt 256MB)
 
-$operationMode = if ($meaningfulTailFree) {
+$operationMode = if ($interruptedRelayout) {
+    'Interrupted WinRE recovery - recreate Recovery partition at a compliant size'
+} elseif ($meaningfulTailFree) {
     'Reclaim unallocated space and recreate WinRE'
 } elseif ($downsizingOnly) {
     'WinRE downsizing only - no meaningful unallocated space'
@@ -1147,6 +1224,8 @@ Write-Host ''
     'Free after WinRE'    = Format-Bytes $tailFree
     'Selected new WinRE'   = Format-Bytes $requestedRecoveryBytes
     'Operation mode'       = $operationMode
+    'WinRE source'         = if ($interruptedRelayout) { $interruptedWimPath } else { 'Active WinRE via REAgentC' }
+    'Known Winre.wim size' = if ($interruptedRelayout) { Format-Bytes $interruptedWimSize } else { '(determined during Execute)' }
     'OS free space'        = Format-Bytes $backupSpacePreflight.FreeBytes
     'Backup space reserve' = Format-Bytes $backupSpacePreflight.RequiredBytes
     'Backup space check'   = 'OK'
@@ -1168,7 +1247,37 @@ if ((-not $meaningfulTailFree) -and ($estimatedDelta -le 0)) {
     Write-Warning 'There is no unallocated space to reclaim and this selection does not increase C: capacity.'
 }
 
+if ($interruptedRelayout) {
+    Write-Warning 'WinRE is currently disabled. This plan uses the retained Winre.wim backup to recreate the existing Recovery partition.'
+    Write-Warning 'Because the current Recovery partition is undersized, this repair requires a partition-table change rather than option 3.'
+}
+
+$bitLockerBlocksExecute = ($bitLockerPreflight.Available -and $bitLockerPreflight.IsEncrypted -and ($bitLockerPreflight.KeyProtectorCount -eq 0))
+if ($bitLockerBlocksExecute) {
+    Write-Warning 'Execute is currently blocked because the encrypted OS volume has no configured BitLocker key protectors.'
+    Write-Warning 'Inspect and restore an appropriate BitLocker protector before attempting the relayout.'
+}
+
 if (-not $Execute) {
+    if ($interruptedRelayout) {
+        Write-Host ''
+        Write-Host 'DRY RUN ONLY - no changes were made.' -ForegroundColor Yellow
+        Write-Host ''
+        if ($bitLockerBlocksExecute) {
+            Write-Host 'NEXT STEP:' -ForegroundColor Yellow
+            Write-Host '  Repair/restore the BitLocker key-protector configuration first.'
+            Write-Host '  Execute will refuse to modify partitions until BitLocker can be protected again.'
+        }
+        else {
+            Write-Host 'NEXT STEPS:' -ForegroundColor Yellow
+            Write-Host '  1. Review the interrupted-recovery relayout above.'
+            Write-Host '  2. Run Execute with the same Recovery size.'
+            Write-Host '  3. Type RELAYOUT when prompted.'
+            Write-Host '  4. Reboot, then use option 3 until final confirmation passes.'
+        }
+        exit 0
+    }
+
     Write-Host @'
 
 DRY RUN ONLY - no changes were made.
@@ -1190,6 +1299,11 @@ AFTER EXECUTE COMPLETES:
     exit 0
 }
 
+if ($bitLockerBlocksExecute) {
+    Write-Warning 'Execute is blocked before confirmation because BitLocker has no configured key protectors.'
+    Write-Host 'No changes were made.' -ForegroundColor Yellow
+    exit 2
+}
 if (-not $Force) {
     Write-Warning 'This operation modifies the partition table.'
     Write-Warning 'A current backup is strongly recommended.'
@@ -1225,31 +1339,36 @@ try {
         Copy-Item -LiteralPath $reAgentXml -Destination (Join-Path $backupDir 'ReAgent.xml.before') -Force
     }
 
-    Write-Step 'Disabling WinRE'
-    Invoke-ReAgentC -Arguments @('/disable') | Out-Null
-
-    $winreWim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
-    try {
+    if ($interruptedRelayout) {
+        Write-Step 'Using the retained WinRE image from the interrupted relayout'
+        $winreWim = $interruptedWimPath
         $winreWimItem = Get-Item -LiteralPath $winreWim -Force -ErrorAction Stop
     }
-    catch {
-        # No destructive action has occurred yet.
-        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-        throw "WinRE was disabled, but $winreWim could not be accessed. The old recovery partition has NOT been deleted."
+    else {
+        Write-Step 'Disabling WinRE'
+        Invoke-ReAgentC -Arguments @('/disable') | Out-Null
+
+        $winreWim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
+        try {
+            $winreWimItem = Get-Item -LiteralPath $winreWim -Force -ErrorAction Stop
+        }
+        catch {
+            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+            throw "WinRE was disabled, but $winreWim could not be accessed. The old recovery partition has NOT been deleted."
+        }
     }
 
-    # /disable has now staged the real Winre.wim on the OS volume. Check the
-    # exact remaining space required for the independent rollback copy before
-    # attempting the copy. Keep 128 MB additional working headroom.
     $exactBackupRequired = [uint64]$winreWimItem.Length + 128MB
     try {
         $exactBackupSpace = Assert-FreeSpace `
             -DriveLetter $osLetter `
             -RequiredBytes $exactBackupRequired `
-            -Purpose 'Winre.wim rollback backup after staging'
+            -Purpose 'Winre.wim rollback backup'
     }
     catch {
-        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        if (-not $interruptedRelayout) {
+            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        }
         Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
         throw
     }
@@ -1262,16 +1381,17 @@ try {
 
         $backupWimItem = Get-Item -LiteralPath (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
         if ($backupWimItem.Length -ne $winreWimItem.Length) {
-            throw 'Copied Winre.wim size does not match the staged source.'
+            throw 'Copied Winre.wim size does not match the source.'
         }
     }
     catch {
         $backupFailure = $_.Exception.Message
-        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        if (-not $interruptedRelayout) {
+            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        }
         Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
         throw ("Winre.wim backup copy/verification failed before any partition change: {0}" -f $backupFailure)
     }
-
     # Honor the explicitly selected final partition size. Require enough room
     # for Winre.wim plus a small operational margin, but do not silently enlarge
     # the partition beyond the user's choice. Also report when the more generous
