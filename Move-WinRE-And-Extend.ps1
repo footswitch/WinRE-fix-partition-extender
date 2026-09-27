@@ -163,39 +163,145 @@ This script intentionally stops rather than guessing.
     }
 }
 
-function Test-BitLocker {
+function Get-BitLockerState {
     param([char]$DriveLetter)
 
     $cmd = Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue
     if (-not $cmd) {
-        Write-Warning 'Get-BitLockerVolume is unavailable; BitLocker status could not be verified automatically.'
-        return
+        return [pscustomobject]@{
+            Available            = $false
+            DriveLetter          = $DriveLetter
+            VolumeStatus         = 'Unknown'
+            ProtectionStatus     = 'Unknown'
+            LockStatus           = 'Unknown'
+            EncryptionPercentage = $null
+            IsEncrypted          = $null
+        }
     }
 
     try {
-        $bl = Get-BitLockerVolume -MountPoint ("{0}:" -f $DriveLetter)
-        if ($null -ne $bl -and "$($bl.ProtectionStatus)" -eq 'On') {
-            throw @"
-BitLocker protection is ON for $DriveLetter`:.
+        $bl = Get-BitLockerVolume -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop
+        $volumeStatus = "$($bl.VolumeStatus)"
+        $isEncrypted = $volumeStatus -ne 'FullyDecrypted'
 
-Suspend it before continuing, for example:
-
-    Suspend-BitLocker -MountPoint '$DriveLetter`:' -RebootCount 1
-
-Then run this script again.
-"@
-        }
-
-        if ($null -ne $bl) {
-            Write-Host ("BitLocker protection: {0}" -f $bl.ProtectionStatus)
+        return [pscustomobject]@{
+            Available            = $true
+            DriveLetter          = $DriveLetter
+            VolumeStatus         = $volumeStatus
+            ProtectionStatus     = "$($bl.ProtectionStatus)"
+            LockStatus           = "$($bl.LockStatus)"
+            EncryptionPercentage = $bl.EncryptionPercentage
+            IsEncrypted          = $isEncrypted
         }
     }
     catch {
-        if ($_.Exception.Message -like 'BitLocker protection is ON*') {
-            throw
+        Write-Warning "Could not query BitLocker state: $($_.Exception.Message)"
+        return [pscustomobject]@{
+            Available            = $false
+            DriveLetter          = $DriveLetter
+            VolumeStatus         = 'Unknown'
+            ProtectionStatus     = 'Unknown'
+            LockStatus           = 'Unknown'
+            EncryptionPercentage = $null
+            IsEncrypted          = $null
         }
-        Write-Warning "Could not verify BitLocker status: $($_.Exception.Message)"
     }
+}
+
+function Write-BitLockerState {
+    param(
+        [Parameter(Mandatory)]
+        $State,
+        [string]$Prefix = 'BitLocker'
+    )
+
+    if (-not $State.Available) {
+        Write-Warning "$Prefix state could not be verified automatically."
+        return
+    }
+
+    Write-Host ("{0} volume status:     {1}" -f $Prefix, $State.VolumeStatus)
+    Write-Host ("{0} protection:        {1}" -f $Prefix, $State.ProtectionStatus)
+    Write-Host ("{0} lock status:       {1}" -f $Prefix, $State.LockStatus)
+    if ($null -ne $State.EncryptionPercentage) {
+        Write-Host ("{0} encrypted:         {1}%" -f $Prefix, $State.EncryptionPercentage)
+    }
+
+    if ($State.IsEncrypted -and $State.ProtectionStatus -eq 'Off') {
+        Write-Warning 'The OS volume is encrypted, but BitLocker protection is suspended.'
+    }
+}
+
+function Set-BitLockerKnownOneRebootSuspension {
+    param([char]$DriveLetter)
+
+    $state = Get-BitLockerState -DriveLetter $DriveLetter
+    Write-BitLockerState -State $state -Prefix 'BitLocker before Execute'
+
+    if (-not $state.Available) {
+        throw 'BitLocker state could not be verified. Refusing to start partition changes.'
+    }
+
+    if (-not $state.IsEncrypted) {
+        Write-Host 'BitLocker is not enabled on the OS volume; no suspension is required.'
+        return $state
+    }
+
+    $mountPoint = ("{0}:" -f $DriveLetter)
+
+    if ($state.ProtectionStatus -eq 'Off') {
+        Write-Warning 'BitLocker was already suspended before this run.'
+        Write-Host 'Resetting it to a known one-reboot suspension so protection should resume after the required restart.'
+        Resume-BitLocker -MountPoint $mountPoint -ErrorAction Stop | Out-Null
+    }
+
+    Suspend-BitLocker -MountPoint $mountPoint -RebootCount 1 -ErrorAction Stop | Out-Null
+    $after = Get-BitLockerState -DriveLetter $DriveLetter
+
+    if ((-not $after.Available) -or ($after.ProtectionStatus -ne 'Off')) {
+        throw 'Could not establish the required one-reboot BitLocker suspension.'
+    }
+
+    Write-Host 'BitLocker protection is suspended for one reboot.' -ForegroundColor Yellow
+    Write-Host 'It should automatically resume after the required post-Execute restart.' -ForegroundColor Yellow
+    return $after
+}
+
+function Ensure-BitLockerResumedForFinalConfirmation {
+    param([char]$DriveLetter)
+
+    $state = Get-BitLockerState -DriveLetter $DriveLetter
+
+    if (-not $state.Available) {
+        return [pscustomobject]@{ State = $state; Issue = 'BitLocker state could not be verified.' }
+    }
+
+    if (-not $state.IsEncrypted) {
+        return [pscustomobject]@{ State = $state; Issue = $null }
+    }
+
+    if ($state.ProtectionStatus -eq 'On') {
+        return [pscustomobject]@{ State = $state; Issue = $null }
+    }
+
+    Write-Warning 'BitLocker is encrypted but protection is still suspended after reboot.'
+    Write-Host 'Attempting to resume BitLocker protection now.'
+
+    try {
+        Resume-BitLocker -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 500
+        $state = Get-BitLockerState -DriveLetter $DriveLetter
+    }
+    catch {
+        return [pscustomobject]@{ State = $state; Issue = "BitLocker protection is suspended and could not be resumed: $($_.Exception.Message)" }
+    }
+
+    if ($state.ProtectionStatus -ne 'On') {
+        return [pscustomobject]@{ State = $state; Issue = 'BitLocker protection remains suspended after Resume-BitLocker.' }
+    }
+
+    Write-Host 'BitLocker protection resumed successfully.' -ForegroundColor Green
+    return [pscustomobject]@{ State = $state; Issue = $null }
 }
 
 function Round-Up {
