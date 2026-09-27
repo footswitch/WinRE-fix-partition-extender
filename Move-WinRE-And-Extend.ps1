@@ -1070,12 +1070,19 @@ try {
     Write-Host ("Free space before backup: {0}" -f (Format-Bytes $exactBackupSpace.FreeBytes))
     Write-Host ("Backup copy requirement:   {0}" -f (Format-Bytes $exactBackupSpace.RequiredBytes))
 
-    Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force
+    try {
+        Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
 
-    $backupWimItem = Get-Item -LiteralPath (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
-    if ($backupWimItem.Length -ne $winreWimItem.Length) {
+        $backupWimItem = Get-Item -LiteralPath (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
+        if ($backupWimItem.Length -ne $winreWimItem.Length) {
+            throw 'Copied Winre.wim size does not match the staged source.'
+        }
+    }
+    catch {
+        $backupFailure = $_.Exception.Message
         Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-        throw 'Winre.wim backup verification failed because the copied file size does not match the source.'
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw ("Winre.wim backup copy/verification failed before any partition change: {0}" -f $backupFailure)
     }
 
     # Honor the explicitly selected final partition size. Require enough room
