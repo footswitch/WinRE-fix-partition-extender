@@ -84,13 +84,21 @@ The BAT launcher's Execute option intentionally does **not** pass `-Force`; the 
 
 ## Supported layout
 
-This utility is deliberately narrow. It is intended for:
+This utility is deliberately narrow. It supports both the original blocked-space layout:
 
 ```text
 ... [ Windows partition ] [ active WinRE partition ] [ unallocated space ]
 ```
 
+and re-running a completed layout:
+
+```text
+... [ Windows partition ] [ active WinRE partition ]
+```
+
 where the Windows and WinRE partitions are on the same GPT disk and WinRE is the last existing partition.
+
+On a completed layout, choosing a smaller WinRE partition grows `C:` by the difference. Choosing a larger WinRE partition shrinks `C:` by the required amount, provided Windows reports that the requested shrink is supported. The existing WinRE partition is then recreated at the exact selected size.
 
 ## Not supported
 
@@ -117,7 +125,7 @@ Move-WinRE-And-Extend.bat
 
 Choose **Dry run** first. The launcher asks for a Recovery partition size between **870 and 1100 MB** (press Enter for 1024 MB). Nothing is modified.
 
-Review the detected disk, partition numbers, current sizes, free space, selected Recovery size, and estimated `C:` increase.
+Review the detected disk, partition numbers, current sizes, free space, selected Recovery size, and estimated `C:` change. For an already-completed layout, this may be a small increase or decrease depending on the new WinRE size.
 
 If everything is correct, run the launcher again and choose **Execute**. The PowerShell script will run its checks again and require:
 
