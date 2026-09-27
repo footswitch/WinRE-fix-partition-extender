@@ -252,6 +252,13 @@ function Invoke-WinREConfirmationRecovery {
             $afterRecovery = @($allPartitions | Where-Object { $_.Offset -gt $registeredPartition.Offset })
             $sizeMB = [math]::Round($registeredPartition.Size / 1MB, 0)
 
+            $registeredVolume = $null
+            try {
+                $registeredVolume = $registeredPartition | Get-Volume -ErrorAction Stop
+            }
+            catch {
+            }
+
             $layoutIssues = @()
 
             if ($registeredDisk -ne $disk.Number) {
@@ -269,6 +276,15 @@ function Invoke-WinREConfirmationRecovery {
             if ($registeredPartition.DriveLetter) {
                 $layoutIssues += "The WinRE partition still has drive letter $($registeredPartition.DriveLetter):."
             }
+            if (-not $registeredPartition.IsHidden) {
+                $layoutIssues += 'The WinRE partition is not marked hidden.'
+            }
+            if (-not $registeredPartition.NoDefaultDriveLetter) {
+                $layoutIssues += 'The WinRE partition does not have the no-default-drive-letter attribute.'
+            }
+            if (($null -eq $registeredVolume) -or ("$($registeredVolume.FileSystem)" -ne 'NTFS')) {
+                $layoutIssues += 'The WinRE partition filesystem could not be confirmed as NTFS.'
+            }
             if (($sizeMB -lt 870) -or ($sizeMB -gt 1100)) {
                 $layoutIssues += "The WinRE partition size ($sizeMB MB) is outside the expected 870-1100 MB range."
             }
@@ -276,11 +292,13 @@ function Invoke-WinREConfirmationRecovery {
             if ($layoutIssues.Count -eq 0) {
                 Write-Host ''
                 Write-Host 'FINAL DISK / WINRE STATE CONFIRMED' -ForegroundColor Green
-                Write-Host 'WinRE status:         Enabled'
-                Write-Host ("WinRE location:       disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
-                Write-Host ("Recovery size:        {0} MB" -f $sizeMB)
+                Write-Host 'WinRE status:          Enabled'
+                Write-Host ("WinRE location:        disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
+                Write-Host ("Recovery size:         {0} MB" -f $sizeMB)
+                Write-Host 'Recovery filesystem:   NTFS'
                 Write-Host 'Recovery drive letter: none'
-                Write-Host 'Partition placement:  immediately after C: and last on disk'
+                Write-Host 'Recovery attributes:   hidden + no-default-drive-letter'
+                Write-Host 'Partition placement:   immediately after C: and last on disk'
                 Write-Host ''
                 Write-Host 'The post-reboot validation passed. The relayout operation is complete.' -ForegroundColor Green
                 return
