@@ -328,17 +328,20 @@ try {
     Invoke-ReAgentC -Arguments @('/disable') | Out-Null
 
     $winreWim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
-    if (-not (Test-Path -LiteralPath $winreWim)) {
+    try {
+        $winreWimItem = Get-Item -LiteralPath $winreWim -Force -ErrorAction Stop
+    }
+    catch {
         # No destructive action has occurred yet.
         Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-        throw "WinRE was disabled, but $winreWim was not found. The old recovery partition has NOT been deleted."
+        throw "WinRE was disabled, but $winreWim could not be accessed. The old recovery partition has NOT been deleted."
     }
 
     Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force
 
     # Microsoft requires free room for WinRE servicing. Reserve 250 MB plus
     # a small NTFS/alignment cushion, and round to 64 MB.
-    $wimSize = [uint64](Get-Item -LiteralPath $winreWim).Length
+    $wimSize = [uint64]$winreWimItem.Length
     $minimumByImage = Round-Up -Value ($wimSize + 250MB + 32MB) -Multiple 64MB
     $targetRecoveryBytes = [uint64][math]::Max(
         [double]$requestedRecoveryBytes,
