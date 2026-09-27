@@ -775,6 +775,20 @@ $cChangeText = if ($estimatedDelta -gt 0) {
     'No material size change'
 }
 
+$meaningfulTailFree = $tailFree -ge 64MB
+$downsizingOnly = (-not $meaningfulTailFree) -and ($estimatedDelta -gt 0)
+$lowGain = ($estimatedDelta -gt 0) -and ($estimatedDelta -lt 256MB)
+
+$operationMode = if ($meaningfulTailFree) {
+    'Reclaim unallocated space and recreate WinRE'
+} elseif ($downsizingOnly) {
+    'WinRE downsizing only - no meaningful unallocated space'
+} elseif ($estimatedDelta -eq 0) {
+    'WinRE recreation only - no C: capacity gain'
+} else {
+    'WinRE resize requires C: to shrink'
+}
+
 Write-Host ''
 [pscustomobject]@{
     Disk                  = $disk.Number
@@ -785,9 +799,24 @@ Write-Host ''
     'WinRE size now'      = Format-Bytes $recoveryPartition.Size
     'Free after WinRE'    = Format-Bytes $tailFree
     'Selected new WinRE'  = Format-Bytes $requestedRecoveryBytes
+    'Operation mode'      = $operationMode
     'Estimated C: change' = $cChangeText
     'Projected C: size'   = Format-Bytes ([uint64]$projectedOSSize)
 } | Format-List
+
+if ($downsizingOnly) {
+    Write-Warning 'There is no meaningful unallocated space after WinRE.'
+    Write-Warning 'Any C: gain comes only from recreating WinRE smaller than it is now.'
+    Write-Warning ("Expected C: gain from WinRE downsizing: {0}." -f (Format-Bytes ([uint64]$estimatedDelta)))
+}
+
+if ($lowGain) {
+    Write-Warning ("The expected C: capacity gain is small ({0}). Consider whether recreating WinRE is worth the risk for this amount of space." -f (Format-Bytes ([uint64]$estimatedDelta)))
+}
+
+if ((-not $meaningfulTailFree) -and ($estimatedDelta -le 0)) {
+    Write-Warning 'There is no unallocated space to reclaim and this selection does not increase C: capacity.'
+}
 
 if (-not $Execute) {
     Write-Host @'
