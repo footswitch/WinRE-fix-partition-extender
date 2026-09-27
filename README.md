@@ -115,8 +115,7 @@ The script intentionally stops rather than attempting to handle:
 - dynamic disks;
 - WinRE located on another disk;
 - another partition between Windows and WinRE;
-- an existing partition after WinRE;
-
+- an existing partition after WinRE.
 
 Those cases need individual inspection.
 
