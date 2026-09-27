@@ -12,10 +12,11 @@
       - Requires WinRE to be the partition immediately after Windows and the
         last existing partition on the disk.
       - Supports both free space after WinRE and an already-completed layout.
-      - Refuses to run while BitLocker protection is ON (when detectable).
+      - Manages BitLocker as a known one-reboot suspension for Execute.
       - Backs up Winre.wim before deleting the existing recovery partition.
       - Recreates WinRE using Microsoft's recovery GUID and GPT attributes.
-      - Verifies WinRE at the end.
+      - Treats same-session WinRE enablement as provisional.
+      - Requires post-reboot WinRE / disk / BitLocker confirmation.
 
     Recommended BAT workflow:
       1. Run Move-WinRE-And-Extend.bat and choose Dry run.
