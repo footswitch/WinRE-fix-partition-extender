@@ -247,19 +247,53 @@ function Invoke-WinREConfirmationRecovery {
 
         if ($null -ne $registeredPartition) {
             $registeredType = "$($registeredPartition.GptType)".Trim('{}').ToLowerInvariant()
-            if (($registeredDisk -eq $disk.Number) -and ($registeredType -eq $RecoveryGptTypeBare)) {
+            $allPartitions = @(Get-Partition -DiskNumber $disk.Number | Sort-Object Offset)
+            $nextAfterOS = @($allPartitions | Where-Object { $_.Offset -gt $osPartition.Offset } | Select-Object -First 1)
+            $afterRecovery = @($allPartitions | Where-Object { $_.Offset -gt $registeredPartition.Offset })
+            $sizeMB = [math]::Round($registeredPartition.Size / 1MB, 0)
+
+            $layoutIssues = @()
+
+            if ($registeredDisk -ne $disk.Number) {
+                $layoutIssues += "WinRE is registered on disk $registeredDisk instead of Windows disk $($disk.Number)."
+            }
+            if ($registeredType -ne $RecoveryGptTypeBare) {
+                $layoutIssues += "Partition $registeredPartitionNumber is not the Microsoft Recovery GPT type."
+            }
+            if (($nextAfterOS.Count -ne 1) -or ($nextAfterOS[0].PartitionNumber -ne $registeredPartitionNumber)) {
+                $layoutIssues += 'The WinRE partition is not immediately after the Windows partition.'
+            }
+            if ($afterRecovery.Count -ne 0) {
+                $layoutIssues += 'Another partition exists after the WinRE partition.'
+            }
+            if ($registeredPartition.DriveLetter) {
+                $layoutIssues += "The WinRE partition still has drive letter $($registeredPartition.DriveLetter):."
+            }
+            if (($sizeMB -lt 870) -or ($sizeMB -gt 1100)) {
+                $layoutIssues += "The WinRE partition size ($sizeMB MB) is outside the expected 870-1100 MB range."
+            }
+
+            if ($layoutIssues.Count -eq 0) {
                 Write-Host ''
-                Write-Host 'WINRE CONFIRMED' -ForegroundColor Green
-                Write-Host 'Status:              Enabled'
-                Write-Host ("Location:            disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
-                Write-Host ("Recovery size:       {0}" -f (Format-Bytes $registeredPartition.Size))
-                Write-Host 'No recovery action was necessary.'
+                Write-Host 'FINAL DISK / WINRE STATE CONFIRMED' -ForegroundColor Green
+                Write-Host 'WinRE status:         Enabled'
+                Write-Host ("WinRE location:       disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
+                Write-Host ("Recovery size:        {0} MB" -f $sizeMB)
+                Write-Host 'Recovery drive letter: none'
+                Write-Host 'Partition placement:  immediately after C: and last on disk'
+                Write-Host ''
+                Write-Host 'The post-reboot validation passed. The relayout operation is complete.' -ForegroundColor Green
                 return
+            }
+
+            Write-Warning 'WinRE is enabled, but the final disk layout is not fully normalized:'
+            foreach ($issue in $layoutIssues) {
+                Write-Warning ("  - {0}" -f $issue)
             }
         }
 
-        Write-Warning 'WinRE reports Enabled, but its registered location is not a valid Recovery partition on the Windows disk.'
-        Write-Warning 'Recovery mode will rebuild only the WinRE registration.'
+        Write-Warning 'WinRE confirmation did not pass all final-state checks.'
+        Write-Warning 'Recovery mode will attempt only WinRE metadata/registration repair; it will not resize partitions.'
     }
 
     $recoveryCandidates = @(Get-Partition -DiskNumber $disk.Number | Where-Object { "$($_.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare } | Sort-Object Offset)
@@ -477,13 +511,20 @@ Diagnostic files are retained at:
     }
 
     Write-Host ''
-    Write-Host 'WINRE RECOVERY SUCCESSFUL' -ForegroundColor Green
+    Write-Host 'WINRE RECOVERY APPLIED' -ForegroundColor Green
     Write-Host 'Status:              Enabled'
     Write-Host ("Location:            disk {0}, partition {1}" -f $finalDiskNumber, $finalPartitionNumber)
     Write-Host ("Recovery size:       {0}" -f (Format-Bytes $recoveryPartition.Size))
     Write-Host ("Recovery log/backup: {0}" -f $repairBackupDir)
     Write-Host ''
-    Write-Host 'Reboot once, then run reagentc /info again before deleting any WinRE backup folders.' -ForegroundColor Yellow
+    Write-Host 'REQUIRED FINAL VALIDATION:' -ForegroundColor Yellow
+    Write-Host '  1. Restart Windows.'
+    Write-Host '  2. Run Move-WinRE-And-Extend.bat.'
+    Write-Host '  3. Choose WinRE confirmation / recovery again.'
+    Write-Host '  4. The operation is complete only when it reports:'
+    Write-Host '     FINAL DISK / WINRE STATE CONFIRMED'
+    Write-Host ''
+    Write-Host 'Keep all WinRE backup folders until that post-reboot confirmation succeeds.' -ForegroundColor Yellow
 }
 
 
@@ -599,13 +640,21 @@ Write-Host ''
 if (-not $Execute) {
     Write-Host @'
 
-DRY RUN ONLY — no changes were made.
+DRY RUN ONLY - no changes were made.
 
-If the layout above is correct, reboot Windows first, then run:
+REQUIRED NEXT STEPS:
+  1. Restart Windows.
+  2. Run Move-WinRE-And-Extend.bat again.
+  3. Choose Execute.
+  4. Select the desired Recovery partition size again.
+  5. Type RELAYOUT when prompted.
 
-    .\Move-WinRE-And-Extend.ps1 -Execute
-
-The script will ask you to type RELAYOUT before doing anything destructive.
+AFTER EXECUTE COMPLETES:
+  1. Restart Windows again.
+  2. Run Move-WinRE-And-Extend.bat.
+  3. Choose WinRE confirmation / recovery.
+  4. Do not consider the operation complete until that option reports that
+     the final disk layout and WinRE state are confirmed.
 '@ -ForegroundColor Yellow
     exit 0
 }
@@ -852,14 +901,18 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'SUCCESS' -ForegroundColor Green
+    Write-Host 'RELAYOUT COMPLETED - REBOOT AND CONFIRMATION STILL REQUIRED' -ForegroundColor Green
     Write-Host ("Windows partition is now: {0}" -f (Format-Bytes $finalOS.Size))
     Write-Host ("WinRE partition is now:   {0} (partition {1})" -f `
         (Format-Bytes $finalRecovery.Size), $finalRecovery.PartitionNumber)
     Write-Host ("WinRE backup retained at: {0}" -f $backupDir)
     Write-Host ''
-    Write-Host 'Keep the backup directory until you have rebooted and verified:' -ForegroundColor Yellow
-    Write-Host '    reagentc /info'
+    Write-Host 'REQUIRED NEXT STEPS:' -ForegroundColor Yellow
+    Write-Host '  1. Restart Windows.'
+    Write-Host '  2. Run Move-WinRE-And-Extend.bat.'
+    Write-Host '  3. Choose WinRE confirmation / recovery.'
+    Write-Host '  4. Do not delete the backup directory until that option reports:'
+    Write-Host '     FINAL DISK / WINRE STATE CONFIRMED'
     Write-Host ''
 }
 catch {
