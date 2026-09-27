@@ -56,7 +56,8 @@ echo       You will STILL have to type RELAYOUT in PowerShell
 echo       before any destructive action begins.
 echo.
 echo   [3] WinRE confirmation / recovery
-echo       Verify the current WinRE setup and repair registration if needed.
+echo       Post-reboot validation of the final disk/WinRE state.
+echo       Repairs WinRE registration if needed.
 echo       This mode does NOT delete, create, shrink, or resize partitions.
 echo.
 echo   [4] Unblock PowerShell script
@@ -111,6 +112,16 @@ echo ------------------------------------------------------------
 echo PowerShell exit code: %RC%
 echo ------------------------------------------------------------
 echo.
+if "%RC%"=="0" (
+    echo IMPORTANT:
+    echo   Restart Windows now.
+    echo   After restart, run this BAT again and choose:
+    echo   [3] WinRE confirmation / recovery
+    echo.
+    echo   The operation is complete only after option 3 reports:
+    echo   FINAL DISK / WINRE STATE CONFIRMED
+    echo.
+)
 pause
 goto MENU
 
