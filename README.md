@@ -64,6 +64,8 @@ Safety characteristics:
 - if BitLocker was already suspended, briefly resumes it and then re-suspends with `-RebootCount 1` so the expected resume point is known;
 - the post-reboot confirmation verifies BitLocker protection is back **On**; if it is still suspended, the confirmation mode attempts `Resume-BitLocker` and will not declare final success until protection is restored;
 - backs up `Winre.wim` before deleting the old Recovery partition;
+- records the original Windows partition size, WinRE offset, and WinRE size before destructive work;
+- if a relayout fails after WinRE has been deleted, attempts to restore the original Windows partition size and recreate WinRE at its original offset and original size from the backup;
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
 - verifies the recreated WinRE partition and REAgentC configuration afterward.
 
@@ -103,6 +105,8 @@ where the Windows and WinRE partitions are on the same GPT disk and WinRE is the
 
 On a completed layout, choosing a smaller WinRE partition grows `C:` by the difference. Choosing a larger WinRE partition shrinks `C:` by the required amount, provided Windows reports that the requested shrink is supported. The existing WinRE partition is then recreated at the exact selected size.
 
+When there is no meaningful unallocated space after WinRE, the script explicitly identifies the operation as **WinRE downsizing only**. In that case all capacity gained by `C:` comes from making WinRE smaller. If the expected gain is below **256 MB**, the dry run and Execute preflight warn that the benefit is small relative to the risk of recreating the Recovery partition. If the selected size produces no `C:` gain, the script says so explicitly.
+
 ## Not supported
 
 The script intentionally stops rather than attempting to handle:
@@ -112,7 +116,7 @@ The script intentionally stops rather than attempting to handle:
 - WinRE located on another disk;
 - another partition between Windows and WinRE;
 - an existing partition after WinRE;
-- layouts with no meaningful unallocated space after WinRE.
+
 
 Those cases need individual inspection.
 
@@ -150,6 +154,21 @@ The required workflow is:
    ```
 
 Keep the generated WinRE backup directories until that final confirmation succeeds.
+
+### Automatic rollback after a failed relayout
+
+Before deleting WinRE, Execute records:
+
+- the original Windows partition size;
+- the original WinRE partition offset;
+- the original WinRE partition size;
+- a backup copy of `Winre.wim`.
+
+If an error occurs after the partition table has already been changed, the script attempts an automatic rollback. It removes any partially-created Recovery partition, restores the Windows partition to its original size, recreates WinRE at the original offset and original size, restores `Winre.wim`, reapplies the Recovery GPT attributes, and attempts to register/enable WinRE again.
+
+A rollback is deliberately conservative. If the current layout no longer allows the original Windows size to be restored, if an unexpected partition exists after Windows, or if the WinRE backup is unavailable, rollback stops rather than guessing.
+
+Even after a successful automatic rollback, restart Windows and run **WinRE confirmation / recovery**. The operation is not considered finalized until disk layout, WinRE, and BitLocker all pass the post-reboot confirmation.
 
 ### WinRE confirmation / recovery
 
