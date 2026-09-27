@@ -73,7 +73,7 @@ Safety characteristics:
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
 - verifies the recreated WinRE partition and REAgentC configuration afterward.
 
-The Recovery partition size is user-selectable from **870 MB to 1100 MB**, with **1024 MB** as the default. The selected value is used as the final partition size. During execution the script verifies that the selected size can physically hold the current `Winre.wim` plus a small operational margin. If it cannot, the script stops instead of silently creating a larger partition. If the selected size leaves less than 250 MB above the WIM, the script warns that future servicing headroom is tighter but still honors the selected size.
+The Recovery partition size is user-selectable from **870 MB to 1100 MB**, with **1024 MB** as the default. The selected value is used as the final partition size, but Windows 11 also requires the Recovery partition to leave at least **200 MB free** above the current `Winre.wim`. The script therefore rejects a selected size that cannot satisfy `Winre.wim size + 200 MB`; it never silently enlarges the partition. Microsoft recommends **250 MB free** for servicing, so a selection that leaves 200-249 MB free is accepted with a warning. For example, a 765 MB WIM requires a Recovery partition of approximately 965 MB or larger, so 870 MB is not sufficient for that image.
 
 ### `Move-WinRE-And-Extend.bat`
 
@@ -253,10 +253,11 @@ Recovery mode can:
 
 - find the existing Microsoft Recovery GPT partition on the Windows disk;
 - find `Winre.wim` in `C:\Windows\System32\Recovery` or the newest `C:\WinRE-Relayout-Backup-*\Winre.wim`;
-- normalize the existing Recovery partition GUID/attributes and remove a temporary drive letter;
-- stage a known-good `Winre.wim` in the Windows recovery staging directory;
+- temporarily mount the existing Recovery partition when needed;
+- copy and verify a known-good `Winre.wim` directly under that Recovery partition's `Recovery\WindowsRE` directory;
 - back up and clear stale `ReAgent.xml` / `ReAgent_Merged.xml` metadata;
-- register the staged image;
+- register the image directly from the Recovery partition rather than from the BitLocker-protected OS volume;
+- remove the temporary access path and normalize the Recovery GPT GUID/attributes;
 - run `reagentc /enable`;
 - verify that WinRE is enabled on the expected disk and partition;
 - retain detailed REAgentC logs when recovery fails.
@@ -310,7 +311,10 @@ Dry run reports:
 - volume status, such as `FullyEncrypted`;
 - protection status, `On` or `Off`;
 - lock status;
-- encryption percentage.
+- encryption percentage;
+- configured key-protector count and protector types when available.
+
+If an encrypted OS volume has no configured key protectors, Execute refuses to modify partitions. Post-reboot confirmation also reports that condition explicitly instead of repeatedly attempting `Resume-BitLocker`.
 
 Immediately before Execute modifies partitions, an encrypted OS volume is placed into a known one-reboot BitLocker suspension using:
 

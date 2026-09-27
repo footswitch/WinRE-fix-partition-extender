@@ -305,6 +305,8 @@ function Get-BitLockerState {
             LockStatus           = 'Unknown'
             EncryptionPercentage = $null
             IsEncrypted          = $null
+            KeyProtectorCount    = $null
+            KeyProtectorTypes    = @()
         }
     }
 
@@ -312,6 +314,13 @@ function Get-BitLockerState {
         $bl = Get-BitLockerVolume -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop
         $volumeStatus = "$($bl.VolumeStatus)"
         $isEncrypted = $volumeStatus -ne 'FullyDecrypted'
+
+        $keyProtectors = @($bl.KeyProtector)
+        $keyProtectorTypes = @(
+            $keyProtectors |
+                ForEach-Object { "$($_.KeyProtectorType)" } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
 
         return [pscustomobject]@{
             Available            = $true
@@ -321,6 +330,8 @@ function Get-BitLockerState {
             LockStatus           = "$($bl.LockStatus)"
             EncryptionPercentage = $bl.EncryptionPercentage
             IsEncrypted          = $isEncrypted
+            KeyProtectorCount    = $keyProtectors.Count
+            KeyProtectorTypes    = $keyProtectorTypes
         }
     }
     catch {
@@ -333,6 +344,8 @@ function Get-BitLockerState {
             LockStatus           = 'Unknown'
             EncryptionPercentage = $null
             IsEncrypted          = $null
+            KeyProtectorCount    = $null
+            KeyProtectorTypes    = @()
         }
     }
 }
@@ -356,8 +369,20 @@ function Write-BitLockerState {
         Write-Host ("{0} encrypted:         {1}%" -f $Prefix, $State.EncryptionPercentage)
     }
 
-    if ($State.IsEncrypted -and $State.ProtectionStatus -eq 'Off') {
-        Write-Warning 'The OS volume is encrypted, but BitLocker protection is suspended.'
+    if ($State.IsEncrypted) {
+        if ($null -ne $State.KeyProtectorCount) {
+            Write-Host ("{0} key protectors:     {1}" -f $Prefix, $State.KeyProtectorCount)
+            if ($State.KeyProtectorCount -gt 0) {
+                Write-Host ("{0} protector types:    {1}" -f $Prefix, ($State.KeyProtectorTypes -join ', '))
+            }
+            else {
+                Write-Warning 'The encrypted OS volume has no configured BitLocker key protectors.'
+            }
+        }
+
+        if ($State.ProtectionStatus -eq 'Off') {
+            Write-Warning 'The OS volume is encrypted, but BitLocker protection is suspended.'
+        }
     }
 }
 
@@ -378,10 +403,19 @@ function Set-BitLockerKnownOneRebootSuspension {
 
     $mountPoint = ("{0}:" -f $DriveLetter)
 
+    if ($state.KeyProtectorCount -eq 0) {
+        throw 'The OS volume is encrypted but has no configured BitLocker key protectors. Refusing to change partitions until BitLocker protection is repaired.'
+    }
+
     if ($state.ProtectionStatus -eq 'Off') {
         Write-Warning 'BitLocker was already suspended before this run.'
         Write-Host 'Resetting it to a known one-reboot suspension so protection should resume after the required restart.'
         Resume-BitLocker -MountPoint $mountPoint -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 500
+        $state = Get-BitLockerState -DriveLetter $DriveLetter
+        if ((-not $state.Available) -or ($state.ProtectionStatus -ne 'On')) {
+            throw 'BitLocker could not be resumed before establishing the controlled one-reboot suspension.'
+        }
     }
 
     Suspend-BitLocker -MountPoint $mountPoint -RebootCount 1 -ErrorAction Stop | Out-Null
@@ -411,6 +445,13 @@ function Ensure-BitLockerResumedForFinalConfirmation {
 
     if ($state.ProtectionStatus -eq 'On') {
         return [pscustomobject]@{ State = $state; Issue = $null }
+    }
+
+    if ($state.KeyProtectorCount -eq 0) {
+        return [pscustomobject]@{
+            State = $state
+            Issue = 'BitLocker protection is suspended and the encrypted OS volume has no configured key protectors. Add or restore an appropriate key protector before attempting to resume protection.'
+        }
     }
 
     Write-Warning 'BitLocker is encrypted but protection is still suspended after reboot.'
@@ -756,15 +797,15 @@ Recovery mode will not download or synthesize a WinRE image.
         throw "The Winre.wim candidate is unexpectedly small ($(Format-Bytes $sourceWim.Length)): $($sourceWim.FullName)"
     }
 
-    $recoveryOperationalMinimum = Round-Up -Value ([uint64]$sourceWim.Length + 64MB) -Multiple 1MB
+    $recoveryOperationalMinimum = Round-Up -Value ([uint64]$sourceWim.Length + 200MB) -Multiple 1MB
     $recoveryRecommendedSize = Round-Up -Value ([uint64]$sourceWim.Length + 250MB) -Multiple 1MB
 
     if ($recoveryPartition.Size -lt $recoveryOperationalMinimum) {
-        throw ("The Recovery partition is too small for Winre.wim plus the operational margin. Required: approximately {0} MB." -f [math]::Ceiling($recoveryOperationalMinimum / 1MB))
+        throw ("The Recovery partition is too small for Windows 11 WinRE. Winre.wim requires at least 200 MB free space in the Recovery partition. Required partition size: approximately {0} MB." -f [math]::Ceiling($recoveryOperationalMinimum / 1MB))
     }
 
     if ($recoveryPartition.Size -lt $recoveryRecommendedSize) {
-        Write-Warning 'The Recovery partition leaves less than 250 MB free above Winre.wim. Servicing headroom is tighter, but recovery can continue.'
+        Write-Warning 'The Recovery partition leaves between 200 MB and 250 MB free above Winre.wim. It meets the Windows 11 minimum, but the recommended servicing headroom is tighter.'
     }
 
     Write-Host ''
@@ -795,38 +836,46 @@ Recovery mode will not download or synthesize a WinRE image.
     $repairBackupDir = Join-Path $osRoot "WinRE-Registration-Recovery-$timestamp"
     New-Item -ItemType Directory -Path $repairBackupDir -Force | Out-Null
 
-    Write-Step 'Normalizing the existing Recovery partition metadata'
+    Write-Step 'Preparing the existing Recovery partition'
 
-    $diskPartCommands = @(
-        "select disk $($disk.Number)"
-        "select partition $($recoveryPartition.PartitionNumber)"
-    )
+    $recoveryPartition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $recoveryPartition.PartitionNumber
 
-    if ($recoveryPartition.DriveLetter) {
-        $diskPartCommands += "remove letter=$($recoveryPartition.DriveLetter) noerr"
+    if (-not $recoveryPartition.DriveLetter) {
+        Add-PartitionAccessPath `
+            -DiskNumber $disk.Number `
+            -PartitionNumber $recoveryPartition.PartitionNumber `
+            -AssignDriveLetter `
+            -ErrorAction Stop | Out-Null
+
+        Start-Sleep -Milliseconds 500
+        $recoveryPartition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $recoveryPartition.PartitionNumber
     }
 
-    $diskPartCommands += @(
-        "set id=$RecoveryGptTypeBare"
-        'gpt attributes=0x8000000000000001'
-        'exit'
-    )
-
-    Invoke-DiskPartScript -Commands $diskPartCommands
-
-    Write-Step 'Preparing a staged WinRE image'
-
-    New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
-
-    if ($sourceWim.FullName -ne $stagedWimPath) {
-        Copy-Item -LiteralPath $sourceWim.FullName -Destination $stagedWimPath -Force
+    if (-not $recoveryPartition.DriveLetter) {
+        throw 'Could not assign a temporary drive letter to the existing Recovery partition.'
     }
 
-    $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
-    Copy-Item -LiteralPath $stagedWimPath -Destination (Join-Path $repairBackupDir 'Winre.wim.staged-copy') -Force
+    $recoveryLetter = [char]$recoveryPartition.DriveLetter
+    $recoveryRoot = ("{0}:\" -f $recoveryLetter)
+    if (-not (Test-Path -LiteralPath $recoveryRoot)) {
+        throw "Recovery partition drive letter $recoveryLetter`: is not accessible."
+    }
 
-    Write-Host ("Staged Winre.wim:     {0}" -f $stagedWim.FullName)
-    Write-Host ("Staged image size:    {0}" -f (Format-Bytes $stagedWim.Length))
+    $recoveryWinREDir = Join-Path $recoveryRoot 'Recovery\WindowsRE'
+    $recoveryWimPath = Join-Path $recoveryWinREDir 'Winre.wim'
+
+    New-Item -ItemType Directory -Path $recoveryWinREDir -Force | Out-Null
+    Copy-Item -LiteralPath $sourceWim.FullName -Destination $recoveryWimPath -Force -ErrorAction Stop
+
+    $recoveryWim = Get-Item -LiteralPath $recoveryWimPath -Force -ErrorAction Stop
+    if ($recoveryWim.Length -ne $sourceWim.Length) {
+        throw 'Copied Winre.wim size on the Recovery partition does not match the source.'
+    }
+
+    Copy-Item -LiteralPath $sourceWim.FullName -Destination (Join-Path $repairBackupDir 'Winre.wim.repair-copy') -Force -ErrorAction Stop
+
+    Write-Host ("Recovery Winre.wim:   {0}" -f $recoveryWim.FullName)
+    Write-Host ("Recovery image size:  {0}" -f (Format-Bytes $recoveryWim.Length))
 
     Write-Step 'Backing up and resetting REAgentC registration metadata'
 
@@ -841,23 +890,40 @@ Recovery mode will not download or synthesize a WinRE image.
         }
     }
 
-    try {
-        $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
-    }
-    catch {
-        Copy-Item -LiteralPath (Join-Path $repairBackupDir 'Winre.wim.staged-copy') -Destination $stagedWimPath -Force
-        $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $recoveryWimPath)) {
+        Copy-Item -LiteralPath (Join-Path $repairBackupDir 'Winre.wim.repair-copy') -Destination $recoveryWimPath -Force -ErrorAction Stop
     }
 
-    Write-Step 'Registering the staged WinRE image'
+    Write-Step 'Registering WinRE on the Recovery partition'
 
     $setLog = Join-Path $repairBackupDir 'reagent-set.log'
-    $setResult = Invoke-ReAgentC -Arguments @('/setreimage', '/path', $stagingDir, '/logpath', $setLog) -AllowFailure
+    $setResult = Invoke-ReAgentC -Arguments @('/setreimage', '/path', $recoveryWinREDir, '/logpath', $setLog) -AllowFailure
 
     if ($setResult.ExitCode -ne 0) {
         throw "REAgentC /setreimage failed. Log retained at: $setLog"
     }
 
+    Write-Step 'Finalizing the existing Recovery partition'
+
+    Remove-PartitionAccessPath `
+        -DiskNumber $disk.Number `
+        -PartitionNumber $recoveryPartition.PartitionNumber `
+        -AccessPath ("{0}:" -f $recoveryLetter) `
+        -ErrorAction Stop | Out-Null
+
+    Invoke-DiskPartScript -Commands @(
+        "select disk $($disk.Number)"
+        "select partition $($recoveryPartition.PartitionNumber)"
+        "set id=$RecoveryGptTypeBare"
+        'gpt attributes=0x8000000000000001'
+        'exit'
+    )
+
+    Start-Sleep -Milliseconds 500
+    $recoveryPartition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $recoveryPartition.PartitionNumber
+    if ($recoveryPartition.DriveLetter) {
+        throw "Recovery partition still has drive letter $($recoveryPartition.DriveLetter): after finalization."
+    }
     Write-Step 'Enabling WinRE'
 
     $enableLog = Join-Path $repairBackupDir 'reagent-enable.log'
@@ -1211,21 +1277,21 @@ try {
     # the partition beyond the user's choice. Also report when the more generous
     # 250 MB servicing headroom is not available.
     $wimSize = [uint64]$winreWimItem.Length
-    $minimumOperationalBytes = Round-Up -Value ($wimSize + 64MB) -Multiple 1MB
+    $minimumOperationalBytes = Round-Up -Value ($wimSize + 200MB) -Multiple 1MB
     $recommendedServicingBytes = Round-Up -Value ($wimSize + 250MB) -Multiple 1MB
     $targetRecoveryBytes = $requestedRecoveryBytes
 
     if ($targetRecoveryBytes -lt $minimumOperationalBytes) {
-        throw ("Selected Recovery size ({0} MB) is too small for this Winre.wim. It needs at least approximately {1} MB including the operational margin." -f `
+        throw ("Selected Recovery size ({0} MB) is too small for this Windows 11 Winre.wim. At least approximately {1} MB is required to leave the minimum 200 MB free space." -f `
             $RecoverySizeMB, [math]::Ceiling($minimumOperationalBytes / 1MB))
     }
 
     Write-Host ("Winre.wim size:       {0}" -f (Format-Bytes $wimSize))
     Write-Host ("Selected WinRE size:  {0}" -f (Format-Bytes $targetRecoveryBytes))
-    Write-Host ("Operational minimum:  {0}" -f (Format-Bytes $minimumOperationalBytes))
+    Write-Host ("Windows 11 minimum:   {0}" -f (Format-Bytes $minimumOperationalBytes))
 
     if ($targetRecoveryBytes -lt $recommendedServicingBytes) {
-        Write-Warning ("Selected size leaves less than 250 MB free above Winre.wim. WinRE may work, but future servicing headroom is tighter.")
+        Write-Warning ("Selected size leaves between 200 MB and 250 MB free above Winre.wim. It meets the Windows 11 minimum, but recommended servicing headroom is tighter.")
     }
     Write-Host ("Backup directory:     {0}" -f $backupDir)
 
