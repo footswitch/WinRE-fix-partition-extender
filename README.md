@@ -127,13 +127,26 @@ Choose **Dry run** first. The launcher asks for a Recovery partition size betwee
 
 Review the detected disk, partition numbers, current sizes, free space, selected Recovery size, and estimated `C:` change. For an already-completed layout, this may be a small increase or decrease depending on the new WinRE size.
 
-If everything is correct, run the launcher again and choose **Execute**. The PowerShell script will run its checks again and require:
+The required workflow is:
 
-```text
-RELAYOUT
-```
+1. Run **Dry run**.
+2. If the proposed layout is correct, **restart Windows**.
+3. Run `Move-WinRE-And-Extend.bat` again and choose **Execute**.
+4. Select the desired Recovery size again and type:
 
-before destructive changes begin.
+   ```text
+   RELAYOUT
+   ```
+
+5. When Execute completes successfully, **restart Windows again**.
+6. Run `Move-WinRE-And-Extend.bat` again and choose **WinRE confirmation / recovery**.
+7. The operation is considered complete only when the post-reboot check reports:
+
+   ```text
+   FINAL DISK / WINRE STATE CONFIRMED
+   ```
+
+Keep the generated WinRE backup directories until that final confirmation succeeds.
 
 ### WinRE confirmation / recovery
 
@@ -145,7 +158,7 @@ From the BAT launcher choose **WinRE confirmation / recovery**, or run:
 .\Move-WinRE-And-Extend.ps1 -WinRERecovery
 ```
 
-The mode first checks the current WinRE status. If WinRE is already enabled on a valid Recovery partition, it reports **WINRE CONFIRMED** and makes no changes.
+The mode first checks the current WinRE status and validates the final disk state: WinRE must be enabled on the expected Recovery GPT partition, the partition must be NTFS, hidden, have no default drive letter, be immediately after the Windows partition, be the last partition on the disk, and be within the expected **870–1100 MB** size range. When all checks pass it reports **FINAL DISK / WINRE STATE CONFIRMED** and makes no changes.
 
 If recovery is required, it displays the detected OS disk, Recovery partition, WinRE image source and sizes, then requires the user to type:
 
@@ -253,6 +266,10 @@ This utility modifies the system disk partition table. A power failure, storage 
 **Have a current backup before using `-Execute`.**
 
 The dry-run exists specifically so the detected geometry can be reviewed before any destructive action occurs.
+
+## Windows PowerShell 5.1 compatibility
+
+The PowerShell script intentionally uses ASCII-only source text for console-facing content. This avoids mojibake such as `â€”` when a GitHub-downloaded UTF-8 script without a BOM is executed by Windows PowerShell 5.1 through the BAT launcher.
 
 ## Design goal
 
