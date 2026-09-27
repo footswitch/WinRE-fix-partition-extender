@@ -47,6 +47,10 @@ param(
     [switch]$Execute,
     [switch]$Force,
 
+    # Non-destructive WinRE confirmation/registration recovery mode.
+    [Alias('RecoverWinRE')]
+    [switch]$WinRERecovery,
+
     # Microsoft recommends ~990 MB for WinRE; 1024 MB is the default here.
     [ValidateRange(990, 8192)]
     [int]$RecoverySizeMB = 1024
@@ -191,12 +195,297 @@ function Round-Up {
     return [uint64]([math]::Ceiling($Value / [double]$Multiple) * $Multiple)
 }
 
+function Invoke-WinREConfirmationRecovery {
+    <#
+    .SYNOPSIS
+        Confirms the current WinRE state and repairs registration when needed.
+
+    .DESCRIPTION
+        This mode is for interrupted/partial runs where the Windows partition
+        is already extended and an existing Microsoft Recovery GPT partition
+        remains on the OS disk.
+
+        It never deletes, creates, shrinks, or resizes partitions.
+    #>
+
+    Write-Step 'WinRE confirmation / recovery'
+
+    $osDrive = $env:SystemDrive.TrimEnd(':')
+    if ($osDrive.Length -ne 1) {
+        throw "Unexpected SystemDrive value: $env:SystemDrive"
+    }
+
+    $osLetter = [char]$osDrive
+    $osRoot = ("{0}:\" -f $osLetter)
+    $osPartition = Get-Partition -DriveLetter $osLetter
+    $disk = Get-Disk -Number $osPartition.DiskNumber
+
+    if ($disk.PartitionStyle -ne 'GPT') {
+        throw "WinRE recovery mode currently supports GPT disks only. Disk $($disk.Number) is $($disk.PartitionStyle)."
+    }
+
+    $currentInfo = Invoke-ReAgentC -Arguments @('/info') -AllowFailure
+    $locationPattern = 'GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<partition>\d+)\\Recovery\\WindowsRE'
+    $currentLocation = [regex]::Match($currentInfo.Output, $locationPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $currentEnabled = $currentInfo.Output -match '(?im)Windows RE status:\s*Enabled'
+
+    if ($currentEnabled -and $currentLocation.Success) {
+        $registeredDisk = [int]$currentLocation.Groups['disk'].Value
+        $registeredPartitionNumber = [int]$currentLocation.Groups['partition'].Value
+        $registeredPartition = Get-Partition -DiskNumber $registeredDisk -PartitionNumber $registeredPartitionNumber -ErrorAction SilentlyContinue
+
+        if ($null -ne $registeredPartition) {
+            $registeredType = "$($registeredPartition.GptType)".Trim('{}').ToLowerInvariant()
+            if (($registeredDisk -eq $disk.Number) -and ($registeredType -eq $RecoveryGptTypeBare)) {
+                Write-Host ''
+                Write-Host 'WINRE CONFIRMED' -ForegroundColor Green
+                Write-Host 'Status:              Enabled'
+                Write-Host ("Location:            disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
+                Write-Host ("Recovery size:       {0}" -f (Format-Bytes $registeredPartition.Size))
+                Write-Host 'No recovery action was necessary.'
+                return
+            }
+        }
+
+        Write-Warning 'WinRE reports Enabled, but its registered location is not a valid Recovery partition on the Windows disk.'
+        Write-Warning 'Recovery mode will rebuild only the WinRE registration.'
+    }
+
+    $recoveryCandidates = @(Get-Partition -DiskNumber $disk.Number | Where-Object { "$($_.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare } | Sort-Object Offset)
+
+    if ($recoveryCandidates.Count -eq 0) {
+        throw @"
+No Microsoft Recovery GPT partition was found on Windows disk $($disk.Number).
+
+Recovery mode deliberately does not create/delete/resize partitions.
+Inspect the disk layout before doing any further partition work.
+"@
+    }
+
+    if ($recoveryCandidates.Count -gt 1) {
+        Write-Warning 'More than one Microsoft Recovery partition exists on the Windows disk.'
+        $recoveryCandidates | Select-Object PartitionNumber, DriveLetter, Size, Offset, GptType | Format-Table -AutoSize
+        throw 'Recovery mode will not guess which Recovery partition should be used.'
+    }
+
+    $recoveryPartition = $recoveryCandidates[0]
+
+    $recoveryVolume = $null
+    try {
+        $recoveryVolume = $recoveryPartition | Get-Volume -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "The Recovery volume could not be queried through Get-Volume: $($_.Exception.Message)"
+    }
+
+    if (($null -ne $recoveryVolume) -and (-not [string]::IsNullOrWhiteSpace("$($recoveryVolume.FileSystem)")) -and ("$($recoveryVolume.FileSystem)" -ne 'NTFS')) {
+        throw "Recovery partition $($recoveryPartition.PartitionNumber) is formatted as $($recoveryVolume.FileSystem), not NTFS."
+    }
+
+    $stagingDir = Join-Path $env:SystemRoot 'System32\Recovery'
+    $stagedWimPath = Join-Path $stagingDir 'Winre.wim'
+    $sourceWim = $null
+    $sourceDescription = $null
+
+    try {
+        $sourceWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
+        $sourceDescription = 'Windows staging location'
+    }
+    catch {
+        $backupDirs = @(Get-ChildItem -Path (Join-Path $osRoot 'WinRE-Relayout-Backup-*') -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+
+        foreach ($backupDirCandidate in $backupDirs) {
+            $candidatePath = Join-Path $backupDirCandidate.FullName 'Winre.wim'
+            try {
+                $sourceWim = Get-Item -LiteralPath $candidatePath -Force -ErrorAction Stop
+                $sourceDescription = "Relayout backup: $($backupDirCandidate.FullName)"
+                break
+            }
+            catch {
+            }
+        }
+    }
+
+    if ($null -eq $sourceWim) {
+        throw @"
+No Winre.wim source was found.
+
+Checked:
+  $stagedWimPath
+  $osRoot\WinRE-Relayout-Backup-*\Winre.wim
+
+Recovery mode will not download or synthesize a WinRE image.
+"@
+    }
+
+    if ($sourceWim.Length -lt 50MB) {
+        throw "The Winre.wim candidate is unexpectedly small ($(Format-Bytes $sourceWim.Length)): $($sourceWim.FullName)"
+    }
+
+    if ($recoveryPartition.Size -lt ([uint64]$sourceWim.Length + 250MB)) {
+        throw 'The Recovery partition is too small for Winre.wim plus 250 MB servicing headroom.'
+    }
+
+    Write-Host ''
+    [pscustomobject]@{
+        Disk                   = $disk.Number
+        'Windows partition'    = ("{0}: (partition {1})" -f $osLetter, $osPartition.PartitionNumber)
+        'WinRE status'         = if ($currentEnabled) { 'Enabled, registration requires repair' } else { 'Disabled / not registered' }
+        'Recovery partition'   = $recoveryPartition.PartitionNumber
+        'Recovery size'        = Format-Bytes $recoveryPartition.Size
+        'Recovery filesystem'  = if ($null -ne $recoveryVolume) { "$($recoveryVolume.FileSystem)" } else { 'Could not query' }
+        'Current drive letter' = if ($recoveryPartition.DriveLetter) { ("{0}:" -f $recoveryPartition.DriveLetter) } else { '(none)' }
+        'Winre.wim source'     = $sourceWim.FullName
+        'Winre.wim size'       = Format-Bytes $sourceWim.Length
+        'Source type'          = $sourceDescription
+    } | Format-List
+
+    Write-Host 'Recovery mode will NOT delete, create, shrink, or resize any partition.' -ForegroundColor Yellow
+
+    if (-not $Force) {
+        $confirmation = Read-Host 'Type RECOVER to repair WinRE registration, or anything else to cancel'
+        if ($confirmation -cne 'RECOVER') {
+            Write-Host 'Cancelled. No recovery changes were made.'
+            return
+        }
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $repairBackupDir = Join-Path $osRoot "WinRE-Registration-Recovery-$timestamp"
+    New-Item -ItemType Directory -Path $repairBackupDir -Force | Out-Null
+
+    Write-Step 'Normalizing the existing Recovery partition metadata'
+
+    $diskPartCommands = @(
+        "select disk $($disk.Number)"
+        "select partition $($recoveryPartition.PartitionNumber)"
+    )
+
+    if ($recoveryPartition.DriveLetter) {
+        $diskPartCommands += "remove letter=$($recoveryPartition.DriveLetter) noerr"
+    }
+
+    $diskPartCommands += @(
+        "set id=$RecoveryGptTypeBare"
+        'gpt attributes=0x8000000000000001'
+        'exit'
+    )
+
+    Invoke-DiskPartScript -Commands $diskPartCommands
+
+    Write-Step 'Preparing a staged WinRE image'
+
+    New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+
+    if ($sourceWim.FullName -ne $stagedWimPath) {
+        Copy-Item -LiteralPath $sourceWim.FullName -Destination $stagedWimPath -Force
+    }
+
+    $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $stagedWimPath -Destination (Join-Path $repairBackupDir 'Winre.wim.staged-copy') -Force
+
+    Write-Host ("Staged Winre.wim:     {0}" -f $stagedWim.FullName)
+    Write-Host ("Staged image size:    {0}" -f (Format-Bytes $stagedWim.Length))
+
+    Write-Step 'Backing up and resetting REAgentC registration metadata'
+
+    Invoke-ReAgentC -Arguments @('/disable') -AllowFailure | Out-Null
+
+    $reAgentConfigDir = Join-Path $env:SystemRoot 'System32\Recovery'
+    foreach ($configName in @('ReAgent.xml', 'ReAgent_Merged.xml')) {
+        $configPath = Join-Path $reAgentConfigDir $configName
+        if (Test-Path -LiteralPath $configPath) {
+            Copy-Item -LiteralPath $configPath -Destination (Join-Path $repairBackupDir ($configName + '.before-recovery')) -Force
+            Remove-Item -LiteralPath $configPath -Force
+        }
+    }
+
+    try {
+        $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
+    }
+    catch {
+        Copy-Item -LiteralPath (Join-Path $repairBackupDir 'Winre.wim.staged-copy') -Destination $stagedWimPath -Force
+        $stagedWim = Get-Item -LiteralPath $stagedWimPath -Force -ErrorAction Stop
+    }
+
+    Write-Step 'Registering the staged WinRE image'
+
+    $setLog = Join-Path $repairBackupDir 'reagent-set.log'
+    $setResult = Invoke-ReAgentC -Arguments @('/setreimage', '/path', $stagingDir, '/logpath', $setLog) -AllowFailure
+
+    if ($setResult.ExitCode -ne 0) {
+        throw "REAgentC /setreimage failed. Log retained at: $setLog"
+    }
+
+    Write-Step 'Enabling WinRE'
+
+    $enableLog = Join-Path $repairBackupDir 'reagent-enable.log'
+    $enableResult = Invoke-ReAgentC -Arguments @('/enable', '/logpath', $enableLog) -AllowFailure
+
+    if ($enableResult.ExitCode -ne 0) {
+        Write-Host ''
+        Write-Host 'WINRE RECOVERY DID NOT COMPLETE' -ForegroundColor Red
+        Write-Host ("REAgentC log: {0}" -f $enableLog)
+
+        if (Test-Path -LiteralPath $enableLog) {
+            $interesting = @(Select-String -Path $enableLog -Pattern 'BitlockerEnabled|Partition has bitlocker|using winre.wim|failed to find target partition|failed to install winre|Error' -CaseSensitive:$false -ErrorAction SilentlyContinue | Select-Object -Last 20)
+
+            if ($interesting.Count -gt 0) {
+                Write-Host ''
+                Write-Host 'Relevant REAgentC diagnostics:' -ForegroundColor Yellow
+                foreach ($line in $interesting) {
+                    Write-Host $line.Line
+                }
+            }
+        }
+
+        throw @"
+WinRE could not be enabled.
+
+No partition was deleted, created, shrunk, or resized by recovery mode.
+Diagnostic files are retained at:
+  $repairBackupDir
+"@
+    }
+
+    Write-Step 'Verifying WinRE'
+
+    $finalInfo = Invoke-ReAgentC -Arguments @('/info')
+    $finalLocation = [regex]::Match($finalInfo.Output, $locationPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $finalEnabled = $finalInfo.Output -match '(?im)Windows RE status:\s*Enabled'
+
+    if (-not $finalEnabled -or -not $finalLocation.Success) {
+        throw "REAgentC returned success, but the final WinRE state could not be verified. Logs: $repairBackupDir"
+    }
+
+    $finalDiskNumber = [int]$finalLocation.Groups['disk'].Value
+    $finalPartitionNumber = [int]$finalLocation.Groups['partition'].Value
+
+    if (($finalDiskNumber -ne $disk.Number) -or ($finalPartitionNumber -ne $recoveryPartition.PartitionNumber)) {
+        throw "WinRE enabled on unexpected disk/partition: disk $finalDiskNumber, partition $finalPartitionNumber."
+    }
+
+    Write-Host ''
+    Write-Host 'WINRE RECOVERY SUCCESSFUL' -ForegroundColor Green
+    Write-Host 'Status:              Enabled'
+    Write-Host ("Location:            disk {0}, partition {1}" -f $finalDiskNumber, $finalPartitionNumber)
+    Write-Host ("Recovery size:       {0}" -f (Format-Bytes $recoveryPartition.Size))
+    Write-Host ("Recovery log/backup: {0}" -f $repairBackupDir)
+    Write-Host ''
+    Write-Host 'Reboot once, then run reagentc /info again before deleting any WinRE backup folders.' -ForegroundColor Yellow
+}
+
 
 # ---------------------------------------------------------------------------
 # PRE-FLIGHT
 # ---------------------------------------------------------------------------
 
 Assert-Administrator
+
+if ($WinRERecovery) {
+    Invoke-WinREConfirmationRecovery
+    exit 0
+}
 
 Write-Step 'Detecting Windows and WinRE layout'
 
