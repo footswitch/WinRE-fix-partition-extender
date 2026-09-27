@@ -555,32 +555,46 @@ $tailFree = if ($disk.Size -gt $recoveryEnd) {
     [uint64]0
 }
 
-# Ignore only the tiny GPT/alignment tail. The intended scenario has real free space.
-if ($tailFree -lt 64MB) {
-    throw "Less than 64 MB of unallocated space was detected after WinRE ($(Format-Bytes $tailFree)). This does not match the intended layout."
-}
-
+# A completed previous run may legitimately have almost no unallocated space
+# after WinRE. Redo mode supports that state by deleting/recreating WinRE and
+# resizing C: either upward or downward to leave the newly selected size.
 Test-BitLocker -DriveLetter $osLetter
 
 $requestedRecoveryBytes = [uint64]$RecoverySizeMB * $MiB
-$estimatedGain = [int64]$recoveryPartition.Size + [int64]$tailFree - [int64]$requestedRecoveryBytes
+$estimatedDelta = [int64]$recoveryPartition.Size + [int64]$tailFree - [int64]$requestedRecoveryBytes
+$projectedOSSize = [int64]$osPartition.Size + $estimatedDelta
+
+$osSupportedBefore = Get-PartitionSupportedSize `
+    -DiskNumber $osPartition.DiskNumber `
+    -PartitionNumber $osPartition.PartitionNumber
+
+if ($projectedOSSize -lt [int64]$osSupportedBefore.SizeMin) {
+    throw ("The selected Recovery size would require shrinking Windows below its supported minimum. Projected C: size: {0}; minimum supported: {1}." -f `
+        (Format-Bytes ([uint64]$projectedOSSize)), (Format-Bytes ([uint64]$osSupportedBefore.SizeMin))
+    )
+}
+
+$cChangeText = if ($estimatedDelta -gt 0) {
+    "Increase by $(Format-Bytes ([uint64]$estimatedDelta))"
+} elseif ($estimatedDelta -lt 0) {
+    "Decrease by $(Format-Bytes ([uint64](-$estimatedDelta)))"
+} else {
+    'No material size change'
+}
 
 Write-Host ''
 [pscustomobject]@{
-    Disk                    = $disk.Number
-    'Disk size'             = Format-Bytes $disk.Size
-    'Windows partition'     = "$osLetter`: (partition $($osPartition.PartitionNumber))"
-    'Windows size now'      = Format-Bytes $osPartition.Size
-    'WinRE partition'       = $recoveryPartition.PartitionNumber
-    'WinRE size now'        = Format-Bytes $recoveryPartition.Size
-    'Free after WinRE'      = Format-Bytes $tailFree
-    'Requested new WinRE'   = Format-Bytes $requestedRecoveryBytes
-    'Estimated C: increase' = if ($estimatedGain -gt 0) { Format-Bytes ([uint64]$estimatedGain) } else { 'NONE' }
+    Disk                  = $disk.Number
+    'Disk size'           = Format-Bytes $disk.Size
+    'Windows partition'   = "$osLetter`: (partition $($osPartition.PartitionNumber))"
+    'Windows size now'    = Format-Bytes $osPartition.Size
+    'WinRE partition'     = $recoveryPartition.PartitionNumber
+    'WinRE size now'      = Format-Bytes $recoveryPartition.Size
+    'Free after WinRE'    = Format-Bytes $tailFree
+    'Selected new WinRE'  = Format-Bytes $requestedRecoveryBytes
+    'Estimated C: change' = $cChangeText
+    'Projected C: size'   = Format-Bytes ([uint64]$projectedOSSize)
 } | Format-List
-
-if ($estimatedGain -le 0) {
-    throw 'The requested WinRE size would leave no space to extend Windows.'
-}
 
 if (-not $Execute) {
     Write-Host @'
@@ -662,12 +676,6 @@ try {
     }
     Write-Host ("Backup directory:     {0}" -f $backupDir)
 
-    $availableAfterDeleteEstimate = [uint64]($recoveryPartition.Size + $tailFree)
-    if ($availableAfterDeleteEstimate -le $targetRecoveryBytes) {
-        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-        throw 'There is not enough recoverable+unallocated space to keep the required WinRE size and also extend Windows.'
-    }
-
     Write-Step 'Deleting the existing WinRE partition'
     $destructiveStarted = $true
 
@@ -689,9 +697,11 @@ try {
         throw 'The old WinRE partition still exists after DiskPart reported completion.'
     }
 
-    Write-Step 'Extending the Windows partition while reserving space for WinRE'
+    Write-Step 'Resizing the Windows partition while reserving the selected WinRE size'
 
-    # Refresh the OS partition after the partition table change.
+    # Refresh the OS partition after deleting WinRE. SizeMax now reaches the end
+    # of the usable disk. Subtract the exact requested Recovery size; this may
+    # enlarge C: (initial layout) or shrink it slightly (redo with larger WinRE).
     $osPartition = Get-Partition -DriveLetter $osLetter
     $supported = Get-PartitionSupportedSize `
         -DiskNumber $osPartition.DiskNumber `
@@ -701,25 +711,38 @@ try {
         throw 'Unexpected disk geometry: supported Windows SizeMax is smaller than the WinRE reservation.'
     }
 
-    # Align down to a MiB boundary so the remainder is at least the requested WinRE size.
+    # Align C: down to a MiB boundary. This guarantees at least the selected
+    # Recovery size remains and may leave a sub-MiB alignment tail at disk end.
     $targetOSSize = [uint64](
         [math]::Floor(
             (($supported.SizeMax - $targetRecoveryBytes) / [double]$MiB)
         ) * $MiB
     )
 
-    if ($targetOSSize -le $osPartition.Size) {
-        throw 'Calculated Windows target size is not larger than the current Windows partition.'
+    if ($targetOSSize -lt $supported.SizeMin) {
+        throw ("Windows cannot be shrunk enough to reserve {0} MB for WinRE. Minimum supported C: size is {1}." -f `
+            $RecoverySizeMB, (Format-Bytes ([uint64]$supported.SizeMin))
+        )
     }
 
-    Write-Host ("Windows size before:  {0}" -f (Format-Bytes $osPartition.Size))
+    $currentOSSize = [uint64]$osPartition.Size
+    Write-Host ("Windows size before:  {0}" -f (Format-Bytes $currentOSSize))
     Write-Host ("Windows size target:  {0}" -f (Format-Bytes $targetOSSize))
-    Write-Host ("Increase:             {0}" -f (Format-Bytes ([uint64]($targetOSSize - $osPartition.Size))))
 
-    Resize-Partition `
-        -DiskNumber $osPartition.DiskNumber `
-        -PartitionNumber $osPartition.PartitionNumber `
-        -Size $targetOSSize
+    if ($targetOSSize -gt $currentOSSize) {
+        Write-Host ("Increase:             {0}" -f (Format-Bytes ([uint64]($targetOSSize - $currentOSSize))))
+    } elseif ($targetOSSize -lt $currentOSSize) {
+        Write-Host ("Decrease:             {0}" -f (Format-Bytes ([uint64]($currentOSSize - $targetOSSize))))
+    } else {
+        Write-Host 'Change:               none'
+    }
+
+    if ($targetOSSize -ne $currentOSSize) {
+        Resize-Partition `
+            -DiskNumber $osPartition.DiskNumber `
+            -PartitionNumber $osPartition.PartitionNumber `
+            -Size $targetOSSize
+    }
 
     Write-Step 'Creating the new WinRE partition at the end of the disk'
 
