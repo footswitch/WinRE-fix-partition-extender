@@ -78,7 +78,10 @@ echo ============================================================
 echo DRY RUN
 echo ============================================================
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+call :GETSIZE
+if errorlevel 1 goto MENU
+echo.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -RecoverySizeMB %RECOVERY_SIZE%
 set "RC=%errorlevel%"
 echo.
 echo ------------------------------------------------------------
@@ -94,10 +97,14 @@ echo ============================================================
 echo EXECUTE
 echo ============================================================
 echo.
+call :GETSIZE
+if errorlevel 1 goto MENU
+echo.
+echo Selected Recovery partition size: %RECOVERY_SIZE% MB
 echo The PowerShell script will perform its own safety checks.
 echo It will require you to type RELAYOUT before destructive work.
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Execute
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Execute -RecoverySizeMB %RECOVERY_SIZE%
 set "RC=%errorlevel%"
 echo.
 echo ------------------------------------------------------------
@@ -127,6 +134,39 @@ echo ------------------------------------------------------------
 echo.
 pause
 goto MENU
+
+:GETSIZE
+set "RECOVERY_SIZE="
+set /p "RECOVERY_SIZE=Recovery partition size in MB [870-1100] (default 1024): "
+if not defined RECOVERY_SIZE set "RECOVERY_SIZE=1024"
+
+echo(%RECOVERY_SIZE%| findstr /R /X "[0-9][0-9]*" >nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: Enter a whole number between 870 and 1100.
+    echo.
+    pause
+    exit /b 1
+)
+
+set /a RECOVERY_SIZE_NUM=%RECOVERY_SIZE% >nul 2>&1
+if %RECOVERY_SIZE_NUM% LSS 870 (
+    echo.
+    echo ERROR: Minimum Recovery partition size is 870 MB.
+    echo.
+    pause
+    exit /b 1
+)
+if %RECOVERY_SIZE_NUM% GTR 1100 (
+    echo.
+    echo ERROR: Maximum Recovery partition size is 1100 MB.
+    echo.
+    pause
+    exit /b 1
+)
+
+set "RECOVERY_SIZE=%RECOVERY_SIZE_NUM%"
+exit /b 0
 
 :UNBLOCK
 cls
