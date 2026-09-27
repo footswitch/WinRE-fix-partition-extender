@@ -64,7 +64,7 @@ Safety characteristics:
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
 - verifies the recreated WinRE partition and REAgentC configuration afterward.
 
-The default requested Recovery size is **1024 MB**. During execution the script checks the actual `Winre.wim` size and increases the reservation when necessary to preserve servicing headroom.
+The Recovery partition size is user-selectable from **870 MB to 1100 MB**, with **1024 MB** as the default. The selected value is used as the final partition size. During execution the script checks the actual `Winre.wim` size plus servicing headroom; if the selected size is too small for that machine, it stops and reports the minimum required size instead of silently creating a larger partition.
 
 ### `Move-WinRE-And-Extend.bat`
 
@@ -115,9 +115,9 @@ Keep both files in the same folder and run:
 Move-WinRE-And-Extend.bat
 ```
 
-Choose **Dry run** first. Nothing is modified.
+Choose **Dry run** first. The launcher asks for a Recovery partition size between **870 and 1100 MB** (press Enter for 1024 MB). Nothing is modified.
 
-Review the detected disk, partition numbers, current sizes, free space, requested Recovery size, and estimated `C:` increase.
+Review the detected disk, partition numbers, current sizes, free space, selected Recovery size, and estimated `C:` increase.
 
 If everything is correct, run the launcher again and choose **Execute**. The PowerShell script will run its checks again and require:
 
@@ -190,11 +190,13 @@ Execute with explicit confirmation:
 .\Move-WinRE-And-Extend.ps1 -Execute
 ```
 
-Choose a different Recovery size, for example 1536 MB:
+Choose a different Recovery size, for example 1100 MB:
 
 ```powershell
-.\Move-WinRE-And-Extend.ps1 -Execute -RecoverySizeMB 1536
+.\Move-WinRE-And-Extend.ps1 -Execute -RecoverySizeMB 1100
 ```
+
+Valid values are **870–1100 MB**. Values outside that range are rejected by PowerShell parameter validation.
 
 An unattended mode exists:
 
