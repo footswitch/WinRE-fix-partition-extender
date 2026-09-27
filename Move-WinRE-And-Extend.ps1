@@ -445,23 +445,28 @@ try {
         throw 'Failed to copy Winre.wim to the newly created recovery partition.'
     }
 
-    Write-Step 'Registering and enabling WinRE'
+    Write-Step 'Registering the WinRE image'
 
     Invoke-ReAgentC -Arguments @('/setreimage', '/path', $newWinREDir) | Out-Null
-    Invoke-ReAgentC -Arguments @('/enable') | Out-Null
 
-    Write-Step 'Applying Microsoft Recovery GPT type/attributes and hiding the partition'
+    Write-Step 'Converting the new partition to the Microsoft Recovery type'
 
+    # WinRE must be on the dedicated Recovery partition before /enable is called,
+    # particularly on BitLocker-enabled systems. Remove the temporary letter,
+    # then apply Microsoft's Recovery GPT type and required attributes.
     Invoke-DiskPartScript -Commands @(
         "select disk $($disk.Number)"
         "select partition $($newRecovery.PartitionNumber)"
+        "remove letter=$recoveryLetter"
         "set id=$RecoveryGptTypeBare"
         'gpt attributes=0x8000000000000001'
-        "remove letter=$recoveryLetter"
         'exit'
     )
 
     Start-Sleep -Seconds 1
+
+    Write-Step 'Enabling WinRE'
+    Invoke-ReAgentC -Arguments @('/enable') | Out-Null
 
     Write-Step 'Final verification'
 
