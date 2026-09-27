@@ -59,7 +59,10 @@ Safety characteristics:
 - does not assume Disk 0;
 - GPT-only;
 - refuses unsupported partition geometry rather than guessing;
-- refuses to proceed when BitLocker protection is detected as enabled;
+- detects the OS volume's full BitLocker state (encryption status and protection status);
+- when the OS volume is BitLocker-encrypted, establishes a known **one-reboot suspension** immediately before partition changes;
+- if BitLocker was already suspended, briefly resumes it and then re-suspends with `-RebootCount 1` so the expected resume point is known;
+- the post-reboot confirmation verifies BitLocker protection is back **On**; if it is still suspended, the confirmation mode attempts `Resume-BitLocker` and will not declare final success until protection is restored;
 - backs up `Winre.wim` before deleting the old Recovery partition;
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
 - verifies the recreated WinRE partition and REAgentC configuration afterward.
@@ -138,7 +141,7 @@ The required workflow is:
    RELAYOUT
    ```
 
-5. When Execute completes successfully, **restart Windows again**.
+5. When Execute finishes the partition changes, **restart Windows again**. An immediate same-session `reagentc /info` may still report WinRE as Disabled even when `reagentc /enable` returned success; this is treated as pending post-reboot validation rather than a partition-operation failure.
 6. Run `Move-WinRE-And-Extend.bat` again and choose **WinRE confirmation / recovery**.
 7. The operation is considered complete only when the post-reboot check reports:
 
@@ -158,7 +161,7 @@ From the BAT launcher choose **WinRE confirmation / recovery**, or run:
 .\Move-WinRE-And-Extend.ps1 -WinRERecovery
 ```
 
-The mode first checks the current WinRE status and validates the final disk state: WinRE must be enabled on the expected Recovery GPT partition, the partition must be NTFS, hidden, have no default drive letter, be immediately after the Windows partition, be the last partition on the disk, and be within the expected **870–1100 MB** size range. When all checks pass it reports **FINAL DISK / WINRE STATE CONFIRMED** and makes no changes.
+The mode first checks the current WinRE status and validates the final disk state: WinRE must be enabled on the expected Recovery GPT partition, the partition must be NTFS, hidden, have no default drive letter, be immediately after the Windows partition, be the last partition on the disk, and be within the expected **870–1100 MB** size range. If the OS volume is BitLocker-encrypted, protection must also be **On**; if it is still suspended, the mode attempts to resume it. When all checks pass it reports **FINAL DISK / WINRE STATE CONFIRMED**.
 
 If recovery is required, it displays the detected OS disk, Recovery partition, WinRE image source and sizes, then requires the user to type:
 
@@ -229,15 +232,26 @@ Use `-Force` only after validating the same machine/layout with a dry-run.
 
 ## BitLocker
 
-If BitLocker protection is active on the Windows volume, the script stops rather than suspending it automatically.
+The script now distinguishes between **encryption state** and **protection state**. This matters because a BitLocker volume can remain fully encrypted while `ProtectionStatus` is `Off`, which means its key protectors are suspended rather than the volume being decrypted.
 
-A typical temporary suspension is:
+Dry run reports:
+
+- volume status, such as `FullyEncrypted`;
+- protection status, `On` or `Off`;
+- lock status;
+- encryption percentage.
+
+Immediately before Execute modifies partitions, an encrypted OS volume is placed into a known one-reboot BitLocker suspension using:
 
 ```powershell
 Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
 ```
 
-Then rerun the utility.
+If protection was already suspended before Execute, the script resumes it first and then establishes the one-reboot suspension. This avoids carrying an unknown or indefinite suspension forward from an earlier interrupted attempt.
+
+After the required restart, **WinRE confirmation / recovery** checks BitLocker again. If the OS volume remains encrypted but protection is still `Off`, it attempts `Resume-BitLocker`. Final confirmation does not pass while an encrypted OS volume remains suspended.
+
+Microsoft documents that suspending BitLocker does not decrypt the volume; it temporarily makes the volume encryption key available, and `-RebootCount 1` schedules protection to resume after the next restart.
 
 ## Recovery backup
 
