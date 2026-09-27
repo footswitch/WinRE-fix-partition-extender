@@ -76,6 +76,7 @@ Convenience launcher for Windows users. It:
 - provides a menu for:
   - **Dry run**
   - **Execute**
+  - **WinRE confirmation / recovery**
   - **Unblock PowerShell script**
   - **Exit**
 
@@ -126,6 +127,47 @@ RELAYOUT
 
 before destructive changes begin.
 
+### WinRE confirmation / recovery
+
+Use this mode after an interrupted or partially successful relayout when the Windows partition is already extended and an existing Microsoft Recovery GPT partition remains on the OS disk.
+
+From the BAT launcher choose **WinRE confirmation / recovery**, or run:
+
+```powershell
+.\Move-WinRE-And-Extend.ps1 -WinRERecovery
+```
+
+The mode first checks the current WinRE status. If WinRE is already enabled on a valid Recovery partition, it reports **WINRE CONFIRMED** and makes no changes.
+
+If recovery is required, it displays the detected OS disk, Recovery partition, WinRE image source and sizes, then requires the user to type:
+
+```text
+RECOVER
+```
+
+before changing WinRE configuration.
+
+This mode is deliberately non-destructive with respect to disk geometry. It does **not**:
+
+- delete partitions;
+- create partitions;
+- shrink partitions;
+- extend or resize partitions.
+
+Recovery mode can:
+
+- find the existing Microsoft Recovery GPT partition on the Windows disk;
+- find `Winre.wim` in `C:\Windows\System32\Recovery` or the newest `C:\WinRE-Relayout-Backup-*\Winre.wim`;
+- normalize the existing Recovery partition GUID/attributes and remove a temporary drive letter;
+- stage a known-good `Winre.wim` in the Windows recovery staging directory;
+- back up and clear stale `ReAgent.xml` / `ReAgent_Merged.xml` metadata;
+- register the staged image;
+- run `reagentc /enable`;
+- verify that WinRE is enabled on the expected disk and partition;
+- retain detailed REAgentC logs when recovery fails.
+
+If more than one Microsoft Recovery partition exists, the mode stops instead of guessing which partition should be used.
+
 ### PowerShell directly
 
 Open Windows PowerShell or Terminal **as Administrator**.
@@ -134,6 +176,12 @@ Dry-run:
 
 ```powershell
 .\Move-WinRE-And-Extend.ps1
+```
+
+WinRE confirmation/recovery:
+
+```powershell
+.\Move-WinRE-And-Extend.ps1 -WinRERecovery
 ```
 
 Execute with explicit confirmation:
