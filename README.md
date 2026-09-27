@@ -31,8 +31,8 @@ For the supported layout, the PowerShell script:
    - extends the Windows partition while reserving space for a new WinRE partition;
    - creates and formats a new Recovery partition at the end of the disk;
    - copies and registers `Winre.wim`;
-   - applies the Microsoft Recovery GPT partition type and attributes;
-   - re-enables WinRE;
+   - removes the temporary drive letter and applies the Microsoft Recovery GPT partition type and attributes;
+   - only then re-enables WinRE;
    - verifies the final WinRE registration and partition type.
 
 The intended transformation is:
