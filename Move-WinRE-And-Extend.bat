@@ -89,6 +89,11 @@ echo ------------------------------------------------------------
 echo PowerShell exit code: %RC%
 echo ------------------------------------------------------------
 echo.
+if "%RC%"=="2" (
+    echo WinRE needs confirmation/recovery before a new relayout.
+    echo Follow the recovery guidance shown above. Execute has not been started.
+    echo.
+)
 pause
 goto MENU
 
@@ -120,6 +125,11 @@ if "%RC%"=="0" (
     echo.
     echo   The operation is complete only after option 3 reports:
     echo   FINAL DISK / WINRE STATE CONFIRMED
+    echo.
+)
+if "%RC%"=="2" (
+    echo Execute was blocked because WinRE needs confirmation/recovery first.
+    echo Follow the recovery guidance shown above. No relayout was started.
     echo.
 )
 pause

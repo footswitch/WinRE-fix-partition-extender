@@ -205,6 +205,23 @@ A rollback is deliberately conservative. If the current layout no longer allows 
 
 Even after a successful automatic rollback, restart Windows and run **WinRE confirmation / recovery**. The operation is not considered finalized until disk layout, WinRE, and BitLocker all pass the post-reboot confirmation.
 
+### Interrupted-state detection
+
+Dry run and Execute first check whether REAgentC currently reports WinRE as enabled. If WinRE is disabled, the script does not throw a raw location-parsing error and does not start another relayout.
+
+Instead, it performs a non-destructive interrupted-state inspection of the Windows disk:
+
+- counts Microsoft Recovery GPT partitions;
+- reports whether a staged `Winre.wim` is present;
+- reports whether a retained `WinRE-Relayout-Backup-*` image is available;
+- when exactly one Recovery partition exists, checks whether it is immediately after `C:` and is the last partition on disk.
+
+If that single Recovery candidate matches the expected final placement, the script directs the user to **WinRE confirmation / recovery** (option 3) and exits without making changes. Execute is deliberately blocked until WinRE has been repaired/confirmed.
+
+If there is no Recovery partition, more than one candidate, or unexpected partition geometry, the script stops cleanly, prints the current partition layout, and tells the user not to run Execute. Option 3 remains non-destructive and does not create or resize partitions.
+
+The interrupted-state gate returns exit code `2`; the BAT launcher labels that code as recovery/confirmation required instead of presenting it as a successful Execute.
+
 ### WinRE confirmation / recovery
 
 Use this mode after an interrupted or partially successful relayout when the Windows partition is already extended and an existing Microsoft Recovery GPT partition remains on the OS disk.

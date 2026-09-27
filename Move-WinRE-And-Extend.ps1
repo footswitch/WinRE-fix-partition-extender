@@ -175,25 +175,121 @@ function Invoke-DiskPartScript {
 }
 
 function Get-WinRELocation {
-    $result = Invoke-ReAgentC -Arguments @('/info')
+    param([string]$InfoOutput)
+
+    if ([string]::IsNullOrWhiteSpace($InfoOutput)) {
+        $result = Invoke-ReAgentC -Arguments @('/info')
+        $InfoOutput = $result.Output
+    }
+
     $m = [regex]::Match(
-        $result.Output,
+        $InfoOutput,
         'GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<partition>\d+)\\Recovery\\WindowsRE',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase
     )
 
     if (-not $m.Success) {
-        throw @'
-Could not identify an enabled WinRE partition from "reagentc /info".
-This script intentionally stops rather than guessing.
-'@
+        return $null
     }
 
     [pscustomobject]@{
         DiskNumber      = [int]$m.Groups['disk'].Value
         PartitionNumber = [int]$m.Groups['partition'].Value
-        RawInfo         = $result.Output
+        RawInfo         = $InfoOutput
     }
+}
+
+function Write-InterruptedWinREGuidance {
+    param(
+        [Parameter(Mandatory)] [int]$DiskNumber,
+        [Parameter(Mandatory)] [char]$OsLetter
+    )
+
+    $osPartition = Get-Partition -DriveLetter $OsLetter
+    $partitions = @(Get-Partition -DiskNumber $DiskNumber | Sort-Object Offset)
+    $recoveryCandidates = @(
+        $partitions |
+            Where-Object { "$($_.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare }
+    )
+
+    $stagedWimPath = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
+    $stagedWimPresent = Test-Path -LiteralPath $stagedWimPath
+
+    $osRoot = ("{0}:\" -f $OsLetter)
+    $backupDirs = @(Get-ChildItem -Path (Join-Path $osRoot 'WinRE-Relayout-Backup-*') -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $backupWim = $null
+    foreach ($backupDir in $backupDirs) {
+        $candidateBackupWim = Join-Path $backupDir.FullName 'Winre.wim'
+        if (Test-Path -LiteralPath $candidateBackupWim) {
+            $backupWim = $candidateBackupWim
+            break
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'WINRE IS DISABLED - RELAYOUT IS NOT SAFE TO START' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'This usually means a previous WinRE operation was interrupted or is still awaiting recovery/confirmation.'
+    Write-Host 'Dry run will not guess an active WinRE partition, and Execute must not start another relayout in this state.'
+    Write-Host ''
+    Write-Host ("Windows disk:              {0}" -f $DiskNumber)
+    Write-Host ("Recovery GPT candidates:   {0}" -f $recoveryCandidates.Count)
+    Write-Host ("Staged Winre.wim present:  {0}" -f $(if ($stagedWimPresent) { 'Yes' } else { 'No' }))
+    Write-Host ("Relayout backup present:   {0}" -f $(if ($null -ne $backupWim) { 'Yes' } else { 'No' }))
+    if ($null -ne $backupWim) {
+        Write-Host ("Newest usable backup:      {0}" -f $backupWim)
+    }
+
+    if ($recoveryCandidates.Count -eq 1) {
+        $candidate = $recoveryCandidates[0]
+        $nextAfterOS = @($partitions | Where-Object { $_.Offset -gt $osPartition.Offset } | Select-Object -First 1)
+        $afterCandidate = @($partitions | Where-Object { $_.Offset -gt $candidate.Offset })
+        $candidateImmediatelyAfterOS = (
+            ($nextAfterOS.Count -eq 1) -and
+            ($nextAfterOS[0].PartitionNumber -eq $candidate.PartitionNumber)
+        )
+        $candidateLast = $afterCandidate.Count -eq 0
+        $candidateSizeMB = [math]::Round($candidate.Size / 1MB, 0)
+
+        Write-Host ''
+        Write-Host 'Detected Recovery candidate:' -ForegroundColor Cyan
+        Write-Host ("  Partition:               {0}" -f $candidate.PartitionNumber)
+        Write-Host ("  Size:                    {0} MB" -f $candidateSizeMB)
+        Write-Host ("  Immediately after C:     {0}" -f $(if ($candidateImmediatelyAfterOS) { 'Yes' } else { 'No' }))
+        Write-Host ("  Last partition on disk:  {0}" -f $(if ($candidateLast) { 'Yes' } else { 'No' }))
+
+        if ($candidateImmediatelyAfterOS -and $candidateLast) {
+            Write-Host ''
+            Write-Host 'RECOMMENDED NEXT STEP:' -ForegroundColor Green
+            Write-Host '  Run Move-WinRE-And-Extend.bat and choose:'
+            Write-Host '  [3] WinRE confirmation / recovery'
+            Write-Host ''
+            Write-Host 'Option 3 is the intended non-destructive recovery path for this state.'
+            Write-Host 'Do NOT run Execute again before option 3 has repaired/confirmed WinRE.'
+            Write-Host 'If option 3 applies a repair, reboot and run option 3 again until it reports:'
+            Write-Host '  FINAL DISK / WINRE STATE CONFIRMED'
+            return
+        }
+
+        Write-Warning 'A Recovery GPT partition exists, but its placement does not match the expected final layout.'
+        Write-Warning 'Do not run Execute. Option 3 cannot repair partition geometry.'
+    }
+    elseif ($recoveryCandidates.Count -eq 0) {
+        Write-Warning 'No Microsoft Recovery GPT partition exists on the Windows disk.'
+        Write-Warning 'The existing option 3 recovery path cannot recreate a missing partition.'
+        Write-Warning 'Do not run Execute. Inspect the partition layout and retained WinRE backup before further partition changes.'
+    }
+    else {
+        Write-Warning 'More than one Microsoft Recovery GPT partition exists on the Windows disk.'
+        Write-Warning 'The script will not guess which partition is the correct recovery target.'
+        Write-Warning 'Do not run Execute. Inspect the partition layout before further partition changes.'
+    }
+
+    Write-Host ''
+    Write-Host 'Current partition layout:' -ForegroundColor Cyan
+    $partitions |
+        Select-Object PartitionNumber, DriveLetter, Offset, Size, GptType, IsHidden, NoDefaultDriveLetter |
+        Format-Table -AutoSize
 }
 
 function Get-BitLockerState {
@@ -862,7 +958,32 @@ if ("$($disk.OperationalStatus)" -notmatch 'Online') {
     throw "Disk $($disk.Number) is not online. Status: $($disk.OperationalStatus)"
 }
 
-$winre = Get-WinRELocation
+$reAgentInfo = Invoke-ReAgentC -Arguments @('/info') -AllowFailure
+
+if ($reAgentInfo.ExitCode -ne 0) {
+    Write-Warning 'REAgentC /info failed, so the current WinRE state cannot be verified safely.'
+    Write-Warning 'Do not run Execute until the WinRE state has been inspected.'
+    Write-Host ''
+    Write-Host 'No changes were made.' -ForegroundColor Yellow
+    exit 2
+}
+
+$winreEnabled = $reAgentInfo.Output -match '(?im)Windows RE status:\s*Enabled'
+if (-not $winreEnabled) {
+    Write-InterruptedWinREGuidance -DiskNumber $disk.Number -OsLetter $osLetter
+    Write-Host ''
+    Write-Host 'No changes were made.' -ForegroundColor Yellow
+    exit 2
+}
+
+$winre = Get-WinRELocation -InfoOutput $reAgentInfo.Output
+if ($null -eq $winre) {
+    Write-Warning 'REAgentC reports WinRE as Enabled, but no WinRE partition location could be parsed.'
+    Write-Warning 'The script will not guess a partition. Do not run Execute until the WinRE state has been inspected.'
+    Write-Host ''
+    Write-Host 'No changes were made.' -ForegroundColor Yellow
+    exit 2
+}
 
 if ($winre.DiskNumber -ne $osPartition.DiskNumber) {
     throw "WinRE is on disk $($winre.DiskNumber), but Windows is on disk $($osPartition.DiskNumber). Refusing to continue."
