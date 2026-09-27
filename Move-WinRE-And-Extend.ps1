@@ -1351,7 +1351,17 @@ if ($bitLockerBlocksExecute) {
 }
 
 Write-Step 'Checking BitLocker readiness before RELAYOUT confirmation'
-$bitLockerReadyState = Ensure-BitLockerProtectedForExecute -DriveLetter $osLetter
+try {
+    $bitLockerReadyState = Ensure-BitLockerProtectedForExecute -DriveLetter $osLetter
+}
+catch {
+    Write-Host ''
+    Write-Host 'BITLOCKER READINESS FAILED' -ForegroundColor Red
+    Write-Warning $_.Exception.Message
+    Write-Host 'No RELAYOUT confirmation was requested.' -ForegroundColor Yellow
+    Write-Host 'No disk layout change was attempted.' -ForegroundColor Yellow
+    exit 2
+}
 
 if (-not $Force) {
     Write-Warning 'This operation modifies the partition table.'
