@@ -723,7 +723,7 @@ try {
     # BitLocker-protected before we convert it, which makes REAgentC reject it.
     $newRecovery = New-Partition `
         -DiskNumber $disk.Number `
-        -UseMaximumSize `
+        -Size $targetRecoveryBytes `
         -GptType $RecoveryGptType `
         -AssignDriveLetter
 
