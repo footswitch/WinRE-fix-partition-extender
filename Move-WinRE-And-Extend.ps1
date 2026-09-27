@@ -305,6 +305,123 @@ function Ensure-BitLockerResumedForFinalConfirmation {
     return [pscustomobject]@{ State = $state; Issue = $null }
 }
 
+function Invoke-WinRERollback {
+    param(
+        [Parameter(Mandatory)] [int]$DiskNumber,
+        [Parameter(Mandatory)] [char]$OsLetter,
+        [Parameter(Mandatory)] [uint64]$OriginalOSSize,
+        [Parameter(Mandatory)] [uint64]$OriginalRecoveryOffset,
+        [Parameter(Mandatory)] [uint64]$OriginalRecoverySize,
+        [Parameter(Mandatory)] [string]$BackupWimPath
+    )
+
+    Write-Step 'Attempting automatic rollback to the original WinRE layout'
+
+    if (-not (Test-Path -LiteralPath $BackupWimPath)) {
+        throw "Rollback cannot continue because the Winre.wim backup is missing: $BackupWimPath"
+    }
+
+    Invoke-ReAgentC -Arguments @('/disable') -AllowFailure | Out-Null
+
+    $osPartition = Get-Partition -DriveLetter $OsLetter
+    $partitionsAfterOS = @(Get-Partition -DiskNumber $DiskNumber | Where-Object { $_.Offset -gt $osPartition.Offset } | Sort-Object Offset)
+
+    if ($partitionsAfterOS.Count -gt 1) {
+        throw 'Rollback found more than one partition after the Windows partition and will not guess which one to remove.'
+    }
+
+    if ($partitionsAfterOS.Count -eq 1) {
+        $candidate = $partitionsAfterOS[0]
+        $candidateType = "$($candidate.GptType)".Trim('{}').ToLowerInvariant()
+        if ($candidateType -ne $RecoveryGptTypeBare) {
+            throw "Rollback found an unexpected partition after Windows (partition $($candidate.PartitionNumber), type $($candidate.GptType))."
+        }
+
+        Write-Host ("Removing partial Recovery partition {0} before rollback." -f $candidate.PartitionNumber)
+        Invoke-DiskPartScript -Commands @(
+            "select disk $DiskNumber"
+            "select partition $($candidate.PartitionNumber)"
+            'delete partition override'
+            'exit'
+        )
+        Start-Sleep -Milliseconds 750
+    }
+
+    $osPartition = Get-Partition -DriveLetter $OsLetter
+    $supported = Get-PartitionSupportedSize -DiskNumber $DiskNumber -PartitionNumber $osPartition.PartitionNumber
+
+    if (($OriginalOSSize -lt $supported.SizeMin) -or ($OriginalOSSize -gt $supported.SizeMax)) {
+        throw ("Rollback cannot restore the original Windows partition size ({0}). Supported range is {1} to {2}." -f `
+            (Format-Bytes $OriginalOSSize), (Format-Bytes ([uint64]$supported.SizeMin)), (Format-Bytes ([uint64]$supported.SizeMax)))
+    }
+
+    if ([uint64]$osPartition.Size -ne $OriginalOSSize) {
+        Write-Host ("Restoring Windows partition size to {0}." -f (Format-Bytes $OriginalOSSize))
+        Resize-Partition -DiskNumber $DiskNumber -PartitionNumber $osPartition.PartitionNumber -Size $OriginalOSSize
+    }
+
+    Write-Host ("Recreating WinRE at original size {0}." -f (Format-Bytes $OriginalRecoverySize))
+    $restoredRecovery = New-Partition `
+        -DiskNumber $DiskNumber `
+        -Offset $OriginalRecoveryOffset `
+        -Size $OriginalRecoverySize `
+        -GptType $RecoveryGptType `
+        -AssignDriveLetter
+
+    $restoredRecovery | Format-Volume `
+        -FileSystem NTFS `
+        -NewFileSystemLabel 'Windows RE tools' `
+        -Confirm:$false | Out-Null
+
+    $restoredRecovery = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $restoredRecovery.PartitionNumber
+    if (-not $restoredRecovery.DriveLetter) {
+        throw 'Rollback recreated the Recovery partition but did not receive a temporary drive letter.'
+    }
+
+    $rollbackLetter = [char]$restoredRecovery.DriveLetter
+    $rollbackWinREDir = Join-Path ("{0}:\" -f $rollbackLetter) 'Recovery\WindowsRE'
+    New-Item -ItemType Directory -Path $rollbackWinREDir -Force | Out-Null
+    Copy-Item -LiteralPath $BackupWimPath -Destination (Join-Path $rollbackWinREDir 'Winre.wim') -Force
+
+    $setResult = Invoke-ReAgentC -Arguments @('/setreimage', '/path', $rollbackWinREDir) -AllowFailure
+
+    Invoke-DiskPartScript -Commands @(
+        "select disk $DiskNumber"
+        "select partition $($restoredRecovery.PartitionNumber)"
+        "remove letter=$rollbackLetter noerr"
+        'gpt attributes=0x8000000000000001'
+        'exit'
+    )
+
+    $enableResult = Invoke-ReAgentC -Arguments @('/enable') -AllowFailure
+
+    $finalRecovery = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $restoredRecovery.PartitionNumber
+    $sizeDifference = [math]::Abs([int64]$finalRecovery.Size - [int64]$OriginalRecoverySize)
+    $typeOk = "$($finalRecovery.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
+
+    if (($sizeDifference -gt 1MB) -or (-not $typeOk)) {
+        throw 'Rollback recreated a Recovery partition, but its final size or GPT type does not match the original layout.'
+    }
+
+    Write-Host ''
+    Write-Host 'AUTOMATIC ROLLBACK RESTORED THE ORIGINAL PARTITION SIZES' -ForegroundColor Green
+    Write-Host ("Windows partition:   {0}" -f (Format-Bytes $OriginalOSSize))
+    Write-Host ("WinRE partition:     {0}" -f (Format-Bytes $OriginalRecoverySize))
+    Write-Host ("WinRE partition no.: {0}" -f $finalRecovery.PartitionNumber)
+
+    if (($setResult.ExitCode -eq 0) -and ($enableResult.ExitCode -eq 0)) {
+        Write-Host 'WinRE registration was also re-applied; post-reboot confirmation is still required.' -ForegroundColor Yellow
+    } else {
+        Write-Warning 'Partition sizes were restored, but WinRE registration still needs post-reboot confirmation/recovery.'
+    }
+
+    return [pscustomobject]@{
+        LayoutRestored = $true
+        RegistrationCommandSucceeded = (($setResult.ExitCode -eq 0) -and ($enableResult.ExitCode -eq 0))
+        RecoveryPartitionNumber = $finalRecovery.PartitionNumber
+    }
+}
+
 function Round-Up {
     param(
         [uint64]$Value,
