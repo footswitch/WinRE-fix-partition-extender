@@ -51,8 +51,8 @@ param(
     [Alias('RecoverWinRE')]
     [switch]$WinRERecovery,
 
-    # Microsoft recommends ~990 MB for WinRE; 1024 MB is the default here.
-    [ValidateRange(990, 8192)]
+    # User-selectable final WinRE partition size.
+    [ValidateRange(870, 1100)]
     [int]$RecoverySizeMB = 1024
 )
 
@@ -639,17 +639,21 @@ try {
 
     Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force
 
-    # Microsoft requires free room for WinRE servicing. Reserve 250 MB plus
-    # a small NTFS/alignment cushion, and round to 64 MB.
+    # The selected size is the requested final partition size. Verify it can
+    # hold Winre.wim plus Microsoft's servicing headroom and a small filesystem
+    # cushion; do not silently increase beyond the user's selected size.
     $wimSize = [uint64]$winreWimItem.Length
     $minimumByImage = Round-Up -Value ($wimSize + 250MB + 32MB) -Multiple 64MB
-    $targetRecoveryBytes = [uint64][math]::Max(
-        [double]$requestedRecoveryBytes,
-        [double]$minimumByImage
-    )
+    $targetRecoveryBytes = $requestedRecoveryBytes
+
+    if ($targetRecoveryBytes -lt $minimumByImage) {
+        throw ("Selected Recovery size ({0} MB) is too small for this Winre.wim. Minimum required on this machine is approximately {1} MB." -f `
+            $RecoverySizeMB, [math]::Ceiling($minimumByImage / 1MB))
+    }
 
     Write-Host ("Winre.wim size:       {0}" -f (Format-Bytes $wimSize))
-    Write-Host ("New WinRE target:     {0}" -f (Format-Bytes $targetRecoveryBytes))
+    Write-Host ("Selected WinRE size:  {0}" -f (Format-Bytes $targetRecoveryBytes))
+    Write-Host ("Minimum for this WIM:  {0}" -f (Format-Bytes $minimumByImage))
     Write-Host ("Backup directory:     {0}" -f $backupDir)
 
     $availableAfterDeleteEstimate = [uint64]($recoveryPartition.Size + $tailFree)
