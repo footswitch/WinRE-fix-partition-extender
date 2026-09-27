@@ -978,6 +978,10 @@ $bitLockerExecutionState = Set-BitLockerKnownOneRebootSuspension -DriveLetter $o
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backupDir = Join-Path "$osLetter`:\" "WinRE-Relayout-Backup-$timestamp"
 $destructiveStarted = $false
+$originalOSSize = [uint64]$osPartition.Size
+$originalRecoveryOffset = [uint64]$recoveryPartition.Offset
+$originalRecoverySize = [uint64]$recoveryPartition.Size
+$rollbackBackupWimPath = Join-Path $backupDir 'Winre.wim'
 
 try {
     Write-Step 'Creating a local WinRE backup directory'
@@ -1225,25 +1229,62 @@ try {
     Write-Host ''
 }
 catch {
+    $originalFailure = $_
+
     Write-Host ''
     Write-Host 'ERROR' -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host $originalFailure.Exception.Message -ForegroundColor Red
+
+    $rollbackSucceeded = $false
 
     if ($destructiveStarted) {
         Write-Warning 'A partition-table change has already occurred.'
         Write-Warning "Do NOT delete the backup directory: $backupDir"
+
+        if (Test-Path -LiteralPath $rollbackBackupWimPath) {
+            try {
+                $rollbackResult = Invoke-WinRERollback `
+                    -DiskNumber $disk.Number `
+                    -OsLetter $osLetter `
+                    -OriginalOSSize $originalOSSize `
+                    -OriginalRecoveryOffset $originalRecoveryOffset `
+                    -OriginalRecoverySize $originalRecoverySize `
+                    -BackupWimPath $rollbackBackupWimPath
+
+                $rollbackSucceeded = $rollbackResult.LayoutRestored
+            }
+            catch {
+                Write-Host ''
+                Write-Host 'AUTOMATIC ROLLBACK FAILED' -ForegroundColor Red
+                Write-Warning $_.Exception.Message
+                Write-Warning 'Do not make further partition changes until the disk layout has been inspected.'
+            }
+        }
+        else {
+            Write-Warning 'Automatic rollback could not start because the Winre.wim backup is missing.'
+        }
+
         if ($bitLockerExecutionState.Available -and $bitLockerExecutionState.IsEncrypted) {
-            Write-Warning 'BitLocker protection was suspended for the operation. Restart Windows, then run WinRE confirmation / recovery so protection and WinRE state can be finalized.'
+            Write-Warning 'BitLocker protection was suspended for the operation.'
+        }
+
+        Write-Host ''
+        if ($rollbackSucceeded) {
+            Write-Warning 'The relayout failed, but the script restored the original Windows and WinRE partition sizes.'
+        } else {
+            Write-Warning 'The relayout failed and automatic restoration could not be fully verified.'
+        }
+        Write-Warning 'Restart Windows, then run WinRE confirmation / recovery to finalize BitLocker and WinRE state.'
+    }
+    else {
+        Write-Warning 'No partition-table change had occurred before the failure.'
+        Write-Warning 'Attempting to leave WinRE enabled if Windows can do so...'
+        try {
+            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        }
+        catch {
         }
     }
 
-    Write-Warning 'Attempting to leave WinRE enabled if Windows can do so...'
-    try {
-        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-    }
-    catch {
-        # Preserve the original failure.
-    }
-
-    throw
+    throw $originalFailure
 }
