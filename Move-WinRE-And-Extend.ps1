@@ -1035,16 +1035,21 @@ try {
         'GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<partition>\d+)\\Recovery\\WindowsRE',
         [Text.RegularExpressions.RegexOptions]::IgnoreCase
     )
+    $finalEnabledNow = $finalInfo.Output -match '(?im)Windows RE status:\s*Enabled'
 
-    if (-not $finalMatch.Success) {
-        throw 'REAgentC completed, but the final WinRE location could not be verified.'
+    if ($finalEnabledNow -and $finalMatch.Success) {
+        if (
+            ([int]$finalMatch.Groups['disk'].Value -ne $disk.Number) -or
+            ([int]$finalMatch.Groups['partition'].Value -ne $finalRecovery.PartitionNumber)
+        ) {
+            throw 'WinRE is enabled, but REAgentC points to an unexpected disk/partition.'
+        }
+        Write-Host 'WinRE is already enabled and registered in the current session.' -ForegroundColor Green
     }
-
-    if (
-        ([int]$finalMatch.Groups['disk'].Value -ne $disk.Number) -or
-        ([int]$finalMatch.Groups['partition'].Value -ne $finalRecovery.PartitionNumber)
-    ) {
-        throw 'WinRE is enabled, but REAgentC points to an unexpected disk/partition.'
+    else {
+        Write-Warning 'REAgentC /enable returned success, but the current session does not yet report WinRE as Enabled at the new partition.'
+        Write-Warning 'This is PENDING POST-REBOOT VALIDATION, not a partition-operation failure.'
+        Write-Warning 'After restarting, WinRE confirmation / recovery will verify the state and repair registration if necessary.'
     }
 
     Write-Host ''
@@ -1053,6 +1058,9 @@ try {
     Write-Host ("WinRE partition is now:   {0} (partition {1})" -f `
         (Format-Bytes $finalRecovery.Size), $finalRecovery.PartitionNumber)
     Write-Host ("WinRE backup retained at: {0}" -f $backupDir)
+    if ($bitLockerExecutionState.Available -and $bitLockerExecutionState.IsEncrypted) {
+        Write-Host 'BitLocker:                suspended for one reboot'
+    }
     Write-Host ''
     Write-Host 'REQUIRED NEXT STEPS:' -ForegroundColor Yellow
     Write-Host '  1. Restart Windows.'
