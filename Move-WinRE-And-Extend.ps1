@@ -11,22 +11,22 @@
       - Automatically detects the Windows partition and the WinRE partition.
       - Requires WinRE to be the partition immediately after Windows and the
         last existing partition on the disk.
-      - Requires unallocated space after WinRE.
+      - Supports both free space after WinRE and an already-completed layout.
       - Refuses to run while BitLocker protection is ON (when detectable).
       - Backs up Winre.wim before deleting the existing recovery partition.
       - Recreates WinRE using Microsoft's recovery GUID and GPT attributes.
       - Verifies WinRE at the end.
 
-    Recommended usage:
-      1. Reboot Windows first.
-      2. Open Windows PowerShell / Terminal as Administrator.
-      3. Run:
-            .\Move-WinRE-And-Extend.ps1
-         Review the dry-run output.
-      4. If correct:
-            .\Move-WinRE-And-Extend.ps1 -Execute
-         To suppress the final typed confirmation:
-            .\Move-WinRE-And-Extend.ps1 -Execute -Force
+    Recommended BAT workflow:
+      1. Run Move-WinRE-And-Extend.bat and choose Dry run.
+      2. Review the proposed layout and selected WinRE size.
+      3. Restart Windows.
+      4. Run the BAT again and choose Execute.
+      5. Type RELAYOUT when prompted.
+      6. After Execute succeeds, restart Windows again.
+      7. Run the BAT and choose WinRE confirmation / recovery.
+      8. Finish only when it reports:
+            FINAL DISK / WINRE STATE CONFIRMED
 
 .NOTES
     Designed for the common layout:
