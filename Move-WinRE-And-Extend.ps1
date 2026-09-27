@@ -78,6 +78,34 @@ function Format-Bytes([uint64]$Bytes) {
     return ('{0:N0} MB' -f ($Bytes / 1MB))
 }
 
+function Get-VolumeFreeBytes {
+    param([char]$DriveLetter)
+
+    $volume = Get-Volume -DriveLetter $DriveLetter -ErrorAction Stop
+    return [uint64]$volume.SizeRemaining
+}
+
+function Assert-FreeSpace {
+    param(
+        [char]$DriveLetter,
+        [uint64]$RequiredBytes,
+        [string]$Purpose
+    )
+
+    $freeBytes = Get-VolumeFreeBytes -DriveLetter $DriveLetter
+
+    if ($freeBytes -lt $RequiredBytes) {
+        throw ("Insufficient free space on {0}: for {1}. Available: {2}; required: {3}." -f `
+            $DriveLetter, $Purpose, (Format-Bytes $freeBytes), (Format-Bytes $RequiredBytes))
+    }
+
+    return [pscustomobject]@{
+        FreeBytes     = $freeBytes
+        RequiredBytes = $RequiredBytes
+        Purpose       = $Purpose
+    }
+}
+
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -875,6 +903,17 @@ $bitLockerPreflight = Get-BitLockerState -DriveLetter $osLetter
 Write-BitLockerState -State $bitLockerPreflight -Prefix 'BitLocker preflight'
 
 $requestedRecoveryBytes = [uint64]$RecoverySizeMB * $MiB
+
+# Before any WinRE or BitLocker state is changed, make sure the OS volume has
+# enough room for both the temporary WinRE staging copy created by /disable and
+# our independent rollback backup. The current Recovery partition size is used
+# as a conservative upper bound for Winre.wim, plus 256 MB working headroom.
+$backupSpaceReserve = [uint64](2 * $recoveryPartition.Size + 256MB)
+$backupSpacePreflight = Assert-FreeSpace `
+    -DriveLetter $osLetter `
+    -RequiredBytes $backupSpaceReserve `
+    -Purpose 'temporary WinRE staging plus rollback backup'
+
 $estimatedDelta = [int64]$recoveryPartition.Size + [int64]$tailFree - [int64]$requestedRecoveryBytes
 $projectedOSSize = [int64]$osPartition.Size + $estimatedDelta
 
@@ -919,10 +958,13 @@ Write-Host ''
     'WinRE partition'     = $recoveryPartition.PartitionNumber
     'WinRE size now'      = Format-Bytes $recoveryPartition.Size
     'Free after WinRE'    = Format-Bytes $tailFree
-    'Selected new WinRE'  = Format-Bytes $requestedRecoveryBytes
-    'Operation mode'      = $operationMode
-    'Estimated C: change' = $cChangeText
-    'Projected C: size'   = Format-Bytes ([uint64]$projectedOSSize)
+    'Selected new WinRE'   = Format-Bytes $requestedRecoveryBytes
+    'Operation mode'       = $operationMode
+    'OS free space'        = Format-Bytes $backupSpacePreflight.FreeBytes
+    'Backup space reserve' = Format-Bytes $backupSpacePreflight.RequiredBytes
+    'Backup space check'   = 'OK'
+    'Estimated C: change'  = $cChangeText
+    'Projected C: size'    = Format-Bytes ([uint64]$projectedOSSize)
 } | Format-List
 
 if ($downsizingOnly) {
@@ -1009,7 +1051,32 @@ try {
         throw "WinRE was disabled, but $winreWim could not be accessed. The old recovery partition has NOT been deleted."
     }
 
+    # /disable has now staged the real Winre.wim on the OS volume. Check the
+    # exact remaining space required for the independent rollback copy before
+    # attempting the copy. Keep 128 MB additional working headroom.
+    $exactBackupRequired = [uint64]$winreWimItem.Length + 128MB
+    try {
+        $exactBackupSpace = Assert-FreeSpace `
+            -DriveLetter $osLetter `
+            -RequiredBytes $exactBackupRequired `
+            -Purpose 'Winre.wim rollback backup after staging'
+    }
+    catch {
+        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        throw
+    }
+
+    Write-Host ("Free space before backup: {0}" -f (Format-Bytes $exactBackupSpace.FreeBytes))
+    Write-Host ("Backup copy requirement:   {0}" -f (Format-Bytes $exactBackupSpace.RequiredBytes))
+
     Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force
+
+    $backupWimItem = Get-Item -LiteralPath (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
+    if ($backupWimItem.Length -ne $winreWimItem.Length) {
+        Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        throw 'Winre.wim backup verification failed because the copied file size does not match the source.'
+    }
 
     # Honor the explicitly selected final partition size. Require enough room
     # for Winre.wim plus a small operational margin, but do not silently enlarge
