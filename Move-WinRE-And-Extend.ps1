@@ -14,6 +14,10 @@
       - Supports both free space after WinRE and an already-completed layout.
       - Manages BitLocker as a known one-reboot suspension for Execute.
       - Backs up Winre.wim before deleting the existing recovery partition.
+      - Warns when there is no real free space to reclaim and the only gain
+        comes from making WinRE smaller.
+      - Attempts to restore the original C: size, WinRE offset, and WinRE
+        size automatically if a destructive relayout step fails.
       - Recreates WinRE using Microsoft's recovery GUID and GPT attributes.
       - Treats same-session WinRE enablement as provisional.
       - Requires post-reboot WinRE / disk / BitLocker confirmation.
