@@ -639,21 +639,27 @@ try {
 
     Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force
 
-    # The selected size is the requested final partition size. Verify it can
-    # hold Winre.wim plus Microsoft's servicing headroom and a small filesystem
-    # cushion; do not silently increase beyond the user's selected size.
+    # Honor the explicitly selected final partition size. Require enough room
+    # for Winre.wim plus a small operational margin, but do not silently enlarge
+    # the partition beyond the user's choice. Also report when the more generous
+    # 250 MB servicing headroom is not available.
     $wimSize = [uint64]$winreWimItem.Length
-    $minimumByImage = Round-Up -Value ($wimSize + 250MB + 32MB) -Multiple 64MB
+    $minimumOperationalBytes = Round-Up -Value ($wimSize + 64MB) -Multiple 1MB
+    $recommendedServicingBytes = Round-Up -Value ($wimSize + 250MB) -Multiple 1MB
     $targetRecoveryBytes = $requestedRecoveryBytes
 
-    if ($targetRecoveryBytes -lt $minimumByImage) {
-        throw ("Selected Recovery size ({0} MB) is too small for this Winre.wim. Minimum required on this machine is approximately {1} MB." -f `
-            $RecoverySizeMB, [math]::Ceiling($minimumByImage / 1MB))
+    if ($targetRecoveryBytes -lt $minimumOperationalBytes) {
+        throw ("Selected Recovery size ({0} MB) is too small for this Winre.wim. It needs at least approximately {1} MB including the operational margin." -f `
+            $RecoverySizeMB, [math]::Ceiling($minimumOperationalBytes / 1MB))
     }
 
     Write-Host ("Winre.wim size:       {0}" -f (Format-Bytes $wimSize))
     Write-Host ("Selected WinRE size:  {0}" -f (Format-Bytes $targetRecoveryBytes))
-    Write-Host ("Minimum for this WIM:  {0}" -f (Format-Bytes $minimumByImage))
+    Write-Host ("Operational minimum:  {0}" -f (Format-Bytes $minimumOperationalBytes))
+
+    if ($targetRecoveryBytes -lt $recommendedServicingBytes) {
+        Write-Warning ("Selected size leaves less than 250 MB free above Winre.wim. WinRE may work, but future servicing headroom is tighter.")
+    }
     Write-Host ("Backup directory:     {0}" -f $backupDir)
 
     $availableAfterDeleteEstimate = [uint64]($recoveryPartition.Size + $tailFree)
