@@ -63,6 +63,10 @@ Safety characteristics:
 - when the OS volume is BitLocker-encrypted, establishes a known **one-reboot suspension** immediately before partition changes;
 - if BitLocker was already suspended, briefly resumes it and then re-suspends with `-RebootCount 1` so the expected resume point is known;
 - the post-reboot confirmation verifies BitLocker protection is back **On**; if it is still suspended, the confirmation mode attempts `Resume-BitLocker` and will not declare final success until protection is restored;
+- preflights free space on the OS volume before changing WinRE or BitLocker state;
+- conservatively reserves room for both the temporary `Winre.wim` staging copy created by `reagentc /disable` and the independent rollback backup;
+- after WinRE is disabled and the actual `Winre.wim` size is known, performs a second exact free-space check before copying the rollback backup;
+- verifies the copied `Winre.wim` file size matches the staged source before any Recovery partition is deleted;
 - backs up `Winre.wim` before deleting the old Recovery partition;
 - records the original Windows partition size, WinRE offset, and WinRE size before destructive work;
 - if a relayout fails after WinRE has been deleted, attempts to restore the original Windows partition size and recreate WinRE at its original offset and original size from the backup;
@@ -153,6 +157,38 @@ The required workflow is:
    ```
 
 Keep the generated WinRE backup directories until that final confirmation succeeds.
+
+### Backup free-space preflight
+
+The rollback backup is stored on the Windows volume, normally under:
+
+```text
+C:\WinRE-Relayout-Backup-YYYYMMDD-HHMMSS
+```
+
+Before any WinRE or BitLocker state is changed, the script performs a conservative capacity check on the OS volume. It reserves approximately:
+
+```text
+2 x current WinRE partition size + 256 MB
+```
+
+This covers both the temporary WinRE staging copy that `reagentc /disable` may place under `C:\Windows\System32\Recovery` and the separate rollback copy retained by this utility.
+
+The dry run displays:
+
+- current OS-volume free space;
+- the conservative backup/staging reserve;
+- whether the backup-space check passed.
+
+After `reagentc /disable` exposes the actual `Winre.wim`, the script checks again using the real WIM size. Before copying the rollback backup it requires:
+
+```text
+actual Winre.wim size + 128 MB
+```
+
+of remaining free space. If that second check fails, the script attempts to re-enable WinRE, removes the incomplete backup directory, and stops before deleting or resizing any partition.
+
+After copying the backup, the script also verifies that the backup file length matches the source WIM before destructive work begins.
 
 ### Automatic rollback after a failed relayout
 
