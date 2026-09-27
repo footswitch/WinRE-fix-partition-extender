@@ -88,8 +88,19 @@ function Invoke-ReAgentC {
         [switch]$AllowFailure
     )
 
-    $output = & "$env:SystemRoot\System32\reagentc.exe" @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    # Native stderr from reagentc.exe is surfaced by Windows PowerShell as
+    # ErrorRecord objects. With the script-wide ErrorActionPreference='Stop',
+    # that can otherwise turn a normal nonzero reagentc exit into a terminating
+    # PowerShell exception before -AllowFailure can inspect the exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & "$env:SystemRoot\System32\reagentc.exe" @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
 
     foreach ($line in $output) {
         Write-Host $line
