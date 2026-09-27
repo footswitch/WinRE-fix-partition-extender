@@ -342,6 +342,13 @@ function Invoke-WinREConfirmationRecovery {
         throw "WinRE recovery mode currently supports GPT disks only. Disk $($disk.Number) is $($disk.PartitionStyle)."
     }
 
+    Write-Step 'Checking BitLocker protection after reboot'
+    $bitLockerConfirmation = Ensure-BitLockerResumedForFinalConfirmation -DriveLetter $osLetter
+    Write-BitLockerState -State $bitLockerConfirmation.State -Prefix 'BitLocker post-reboot'
+    if ($null -ne $bitLockerConfirmation.Issue) {
+        Write-Warning $bitLockerConfirmation.Issue
+    }
+
     $currentInfo = Invoke-ReAgentC -Arguments @('/info') -AllowFailure
     $locationPattern = 'GLOBALROOT\\device\\harddisk(?<disk>\d+)\\partition(?<partition>\d+)\\Recovery\\WindowsRE'
     $currentLocation = [regex]::Match($currentInfo.Output, $locationPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -368,7 +375,7 @@ function Invoke-WinREConfirmationRecovery {
 
             $layoutIssues = @()
 
-            $bitLockerFinal = Ensure-BitLockerResumedForFinalConfirmation -DriveLetter $osLetter
+            $bitLockerFinal = $bitLockerConfirmation
             if ($null -ne $bitLockerFinal.Issue) {
                 $layoutIssues += $bitLockerFinal.Issue
             }
@@ -1079,6 +1086,9 @@ catch {
     if ($destructiveStarted) {
         Write-Warning 'A partition-table change has already occurred.'
         Write-Warning "Do NOT delete the backup directory: $backupDir"
+        if ($bitLockerExecutionState.Available -and $bitLockerExecutionState.IsEncrypted) {
+            Write-Warning 'BitLocker protection was suspended for the operation. Restart Windows, then run WinRE confirmation / recovery so protection and WinRE state can be finalized.'
+        }
     }
 
     Write-Warning 'Attempting to leave WinRE enabled if Windows can do so...'
