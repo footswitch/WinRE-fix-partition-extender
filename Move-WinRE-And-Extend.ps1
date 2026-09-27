@@ -428,6 +428,45 @@ function Write-BitLockerState {
     }
 }
 
+function Ensure-BitLockerProtectedForExecute {
+    param([char]$DriveLetter)
+
+    $state = Get-BitLockerState -DriveLetter $DriveLetter
+    Write-BitLockerState -State $state -Prefix 'BitLocker Execute readiness'
+
+    if (-not $state.Available) {
+        throw 'BitLocker state could not be verified. Refusing to continue to RELAYOUT confirmation.'
+    }
+
+    if (-not $state.IsEncrypted) {
+        Write-Host 'BitLocker is not enabled on the OS volume; no readiness action is required.'
+        return $state
+    }
+
+    if ($state.KeyProtectorCount -eq 0) {
+        throw 'The OS volume is encrypted but has no configured BitLocker key protectors. Refusing to continue to RELAYOUT confirmation.'
+    }
+
+    if ($state.ProtectionStatus -eq 'On') {
+        Write-Host 'BitLocker protection is already On.' -ForegroundColor Green
+        return $state
+    }
+
+    Write-Warning 'BitLocker protection is currently suspended.'
+    Write-Host 'Attempting to restore BitLocker protection before asking for RELAYOUT confirmation.'
+
+    Resume-BitLocker -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop | Out-Null
+    Start-Sleep -Milliseconds 500
+    $after = Get-BitLockerState -DriveLetter $DriveLetter
+    Write-BitLockerState -State $after -Prefix 'BitLocker after readiness resume'
+
+    if ((-not $after.Available) -or ($after.ProtectionStatus -ne 'On')) {
+        throw 'BitLocker could not be resumed. No RELAYOUT confirmation will be requested and no partition change will be attempted.'
+    }
+
+    Write-Host 'BitLocker protection resumed successfully before RELAYOUT confirmation.' -ForegroundColor Green
+    return $after
+}
 function Set-BitLockerKnownOneRebootSuspension {
     param([char]$DriveLetter)
 
@@ -449,15 +488,8 @@ function Set-BitLockerKnownOneRebootSuspension {
         throw 'The OS volume is encrypted but has no configured BitLocker key protectors. Refusing to change partitions until BitLocker protection is repaired.'
     }
 
-    if ($state.ProtectionStatus -eq 'Off') {
-        Write-Warning 'BitLocker was already suspended before this run.'
-        Write-Host 'Resetting it to a known one-reboot suspension so protection should resume after the required restart.'
-        Resume-BitLocker -MountPoint $mountPoint -ErrorAction Stop | Out-Null
-        Start-Sleep -Milliseconds 500
-        $state = Get-BitLockerState -DriveLetter $DriveLetter
-        if ((-not $state.Available) -or ($state.ProtectionStatus -ne 'On')) {
-            throw 'BitLocker could not be resumed before establishing the controlled one-reboot suspension.'
-        }
+    if ($state.ProtectionStatus -ne 'On') {
+        throw 'BitLocker protection is not On immediately before the controlled suspension. Refusing to start partition changes.'
     }
 
     Suspend-BitLocker -MountPoint $mountPoint -RebootCount 1 -ErrorAction Stop | Out-Null
@@ -1253,9 +1285,14 @@ if ($interruptedRelayout) {
 }
 
 $bitLockerBlocksExecute = ($bitLockerPreflight.Available -and $bitLockerPreflight.IsEncrypted -and ($bitLockerPreflight.KeyProtectorCount -eq 0))
+$bitLockerNeedsResume = ($bitLockerPreflight.Available -and $bitLockerPreflight.IsEncrypted -and ($bitLockerPreflight.ProtectionStatus -eq 'Off'))
 if ($bitLockerBlocksExecute) {
     Write-Warning 'Execute is currently blocked because the encrypted OS volume has no configured BitLocker key protectors.'
     Write-Warning 'Inspect and restore an appropriate BitLocker protector before attempting the relayout.'
+}
+elseif ($bitLockerNeedsResume) {
+    Write-Warning 'BitLocker protection is suspended. Execute will attempt to resume protection before asking for RELAYOUT confirmation.'
+    Write-Warning 'If BitLocker cannot be resumed, Execute will stop before any partition change.'
 }
 
 if (-not $Execute) {
@@ -1272,8 +1309,16 @@ if (-not $Execute) {
             Write-Host 'NEXT STEPS:' -ForegroundColor Yellow
             Write-Host '  1. Review the interrupted-recovery relayout above.'
             Write-Host '  2. Run Execute with the same Recovery size.'
-            Write-Host '  3. Type RELAYOUT when prompted.'
-            Write-Host '  4. Reboot, then use option 3 until final confirmation passes.'
+            if ($bitLockerNeedsResume) {
+                Write-Host '  3. Execute will first try to resume BitLocker protection.'
+                Write-Host '     If that fails, it stops before RELAYOUT confirmation or any partition change.'
+                Write-Host '  4. Only if BitLocker readiness passes, type RELAYOUT when prompted.'
+                Write-Host '  5. Reboot, then use option 3 until final confirmation passes.'
+            }
+            else {
+                Write-Host '  3. Type RELAYOUT when prompted.'
+                Write-Host '  4. Reboot, then use option 3 until final confirmation passes.'
+            }
         }
         exit 0
     }
@@ -1304,6 +1349,10 @@ if ($bitLockerBlocksExecute) {
     Write-Host 'No changes were made.' -ForegroundColor Yellow
     exit 2
 }
+
+Write-Step 'Checking BitLocker readiness before RELAYOUT confirmation'
+$bitLockerReadyState = Ensure-BitLockerProtectedForExecute -DriveLetter $osLetter
+
 if (-not $Force) {
     Write-Warning 'This operation modifies the partition table.'
     Write-Warning 'A current backup is strongly recommended.'
@@ -1319,7 +1368,7 @@ if (-not $Force) {
 # EXECUTION
 # ---------------------------------------------------------------------------
 
-Write-Step 'Preparing BitLocker for the partition operation'
+Write-Step 'Suspending BitLocker for one reboot before partition changes'
 $bitLockerExecutionState = Set-BitLockerKnownOneRebootSuspension -DriveLetter $osLetter
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'

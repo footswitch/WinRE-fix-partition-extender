@@ -318,13 +318,15 @@ Dry run reports:
 
 If an encrypted OS volume has no configured key protectors, Execute refuses to modify partitions. Post-reboot confirmation also reports that condition explicitly instead of repeatedly attempting `Resume-BitLocker`.
 
-Immediately before Execute modifies partitions, an encrypted OS volume is placed into a known one-reboot BitLocker suspension using:
+Execute first verifies that an encrypted OS volume can be returned to protected state. If protection is currently `Off`, the script attempts `Resume-BitLocker` **before** it asks for `RELAYOUT`. If that resume fails, Execute stops before the destructive confirmation and before any partition-table change.
+
+Only after BitLocker readiness passes and the user confirms `RELAYOUT` is the encrypted OS volume placed into a known one-reboot BitLocker suspension using:
 
 ```powershell
 Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
 ```
 
-If protection was already suspended before Execute, the script resumes it first and then establishes the one-reboot suspension. This avoids carrying an unknown or indefinite suspension forward from an earlier interrupted attempt.
+If protection was already suspended before Execute, the readiness phase resumes it and verifies that protection is `On`. If the user then confirms the operation, the script establishes the controlled one-reboot suspension. This avoids carrying an unknown or indefinite suspension forward from an earlier interrupted attempt; if the user cancels after readiness succeeds, BitLocker remains protected.
 
 After the required restart, **WinRE confirmation / recovery** checks BitLocker again. If the OS volume remains encrypted but protection is still `Off`, it attempts `Resume-BitLocker`. Final confirmation does not pass while an encrypted OS volume remains suspended.
 
