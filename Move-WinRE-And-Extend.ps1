@@ -259,6 +259,7 @@ function Get-InterruptedWinREState {
         SourceWimPath                = $sourceWimPath
         SourceWimSize                = if ($null -ne $sourceWimItem) { [uint64]$sourceWimItem.Length } else { $null }
         RequiredRecoveryBytes        = $requiredRecoveryBytes
+        RecommendedRecoveryBytes     = if ($null -ne $sourceWimItem) { Round-Up -Value ([uint64]$sourceWimItem.Length + 250MB) -Multiple 1MB } else { $null }
         UsableCandidate              = $usableCandidate
         CandidateMeetsMinimum        = $candidateMeetsMinimum
     }
@@ -287,6 +288,7 @@ function Write-InterruptedWinREGuidance {
         Write-Host ("Selected Winre.wim source: {0}" -f $State.SourceWimPath)
         Write-Host ("Winre.wim size:            {0}" -f (Format-Bytes $State.SourceWimSize))
         Write-Host ("Minimum Recovery size:     {0}" -f (Format-Bytes $State.RequiredRecoveryBytes))
+        Write-Host ("Recommended Recovery size: {0}" -f (Format-Bytes $State.RecommendedRecoveryBytes))
     }
 
     if ($null -ne $State.RecoveryPartition) {
@@ -1191,10 +1193,14 @@ $requestedRecoveryBytes = [uint64]$RecoverySizeMB * $MiB
 
 if ($interruptedRelayout) {
     $interruptedMinimumRecoveryBytes = Round-Up -Value ($interruptedWimSize + 200MB) -Multiple 1MB
+    $interruptedRecommendedRecoveryBytes = Round-Up -Value ($interruptedWimSize + 250MB) -Multiple 1MB
     if ($requestedRecoveryBytes -lt $interruptedMinimumRecoveryBytes) {
         Write-Warning ("Selected Recovery size ({0} MB) is too small for the retained Winre.wim. Select at least approximately {1} MB." -f $RecoverySizeMB, [math]::Ceiling($interruptedMinimumRecoveryBytes / 1MB))
         Write-Host 'No changes were made.' -ForegroundColor Yellow
         exit 2
+    }
+    if ($requestedRecoveryBytes -lt $interruptedRecommendedRecoveryBytes) {
+        Write-Warning ("Selected Recovery size ({0} MB) meets the Windows 11 minimum but leaves less than the recommended 250 MB servicing headroom. Approximately {1} MB or larger is preferred for this Winre.wim." -f $RecoverySizeMB, [math]::Ceiling($interruptedRecommendedRecoveryBytes / 1MB))
     }
 }
 
