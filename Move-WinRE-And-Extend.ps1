@@ -92,7 +92,7 @@ function Invoke-ReAgentC {
     }
 
     if (($exitCode -ne 0) -and (-not $AllowFailure)) {
-        throw "REAgentC failed with exit code $exitCode: reagentc $($Arguments -join ' ')"
+        throw "REAgentC failed with exit code ${exitCode}: reagentc $($Arguments -join ' ')"
     }
 
     return @{
