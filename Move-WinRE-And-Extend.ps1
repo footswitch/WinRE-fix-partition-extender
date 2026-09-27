@@ -367,6 +367,11 @@ function Invoke-WinREConfirmationRecovery {
 
             $layoutIssues = @()
 
+            $bitLockerFinal = Ensure-BitLockerResumedForFinalConfirmation -DriveLetter $osLetter
+            if ($null -ne $bitLockerFinal.Issue) {
+                $layoutIssues += $bitLockerFinal.Issue
+            }
+
             if ($registeredDisk -ne $disk.Number) {
                 $layoutIssues += "WinRE is registered on disk $registeredDisk instead of Windows disk $($disk.Number)."
             }
@@ -405,6 +410,13 @@ function Invoke-WinREConfirmationRecovery {
                 Write-Host 'Recovery drive letter: none'
                 Write-Host 'Recovery attributes:   hidden + no-default-drive-letter'
                 Write-Host 'Partition placement:   immediately after C: and last on disk'
+                if ($bitLockerFinal.State.Available) {
+                    if ($bitLockerFinal.State.IsEncrypted) {
+                        Write-Host ("BitLocker protection:  {0}" -f $bitLockerFinal.State.ProtectionStatus)
+                    } else {
+                        Write-Host 'BitLocker protection:  not enabled on OS volume'
+                    }
+                }
                 Write-Host ''
                 Write-Host 'The post-reboot validation passed. The relayout operation is complete.' -ForegroundColor Green
                 return
@@ -491,8 +503,15 @@ Recovery mode will not download or synthesize a WinRE image.
         throw "The Winre.wim candidate is unexpectedly small ($(Format-Bytes $sourceWim.Length)): $($sourceWim.FullName)"
     }
 
-    if ($recoveryPartition.Size -lt ([uint64]$sourceWim.Length + 250MB)) {
-        throw 'The Recovery partition is too small for Winre.wim plus 250 MB servicing headroom.'
+    $recoveryOperationalMinimum = Round-Up -Value ([uint64]$sourceWim.Length + 64MB) -Multiple 1MB
+    $recoveryRecommendedSize = Round-Up -Value ([uint64]$sourceWim.Length + 250MB) -Multiple 1MB
+
+    if ($recoveryPartition.Size -lt $recoveryOperationalMinimum) {
+        throw ("The Recovery partition is too small for Winre.wim plus the operational margin. Required: approximately {0} MB." -f [math]::Ceiling($recoveryOperationalMinimum / 1MB))
+    }
+
+    if ($recoveryPartition.Size -lt $recoveryRecommendedSize) {
+        Write-Warning 'The Recovery partition leaves less than 250 MB free above Winre.wim. Servicing headroom is tighter, but recovery can continue.'
     }
 
     Write-Host ''
@@ -723,7 +742,8 @@ $tailFree = if ($disk.Size -gt $recoveryEnd) {
 # A completed previous run may legitimately have almost no unallocated space
 # after WinRE. Redo mode supports that state by deleting/recreating WinRE and
 # resizing C: either upward or downward to leave the newly selected size.
-Test-BitLocker -DriveLetter $osLetter
+$bitLockerPreflight = Get-BitLockerState -DriveLetter $osLetter
+Write-BitLockerState -State $bitLockerPreflight -Prefix 'BitLocker preflight'
 
 $requestedRecoveryBytes = [uint64]$RecoverySizeMB * $MiB
 $estimatedDelta = [int64]$recoveryPartition.Size + [int64]$tailFree - [int64]$requestedRecoveryBytes
@@ -797,6 +817,9 @@ if (-not $Force) {
 # ---------------------------------------------------------------------------
 # EXECUTION
 # ---------------------------------------------------------------------------
+
+Write-Step 'Preparing BitLocker for the partition operation'
+$bitLockerExecutionState = Set-BitLockerKnownOneRebootSuspension -DriveLetter $osLetter
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backupDir = Join-Path "$osLetter`:\" "WinRE-Relayout-Backup-$timestamp"
