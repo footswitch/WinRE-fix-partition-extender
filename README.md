@@ -318,7 +318,7 @@ Dry run reports:
 
 If an encrypted OS volume has no configured key protectors, Execute refuses to modify partitions. Post-reboot confirmation also reports that condition explicitly instead of repeatedly attempting `Resume-BitLocker`.
 
-Execute first verifies that an encrypted OS volume can be returned to protected state. If protection is currently `Off`, the script attempts `Resume-BitLocker` **before** it asks for `RELAYOUT`. If that resume fails, Execute stops before the destructive confirmation and before any partition-table change.
+Execute first verifies that an encrypted OS volume can be returned to protected state. If protection is currently `Off`, the script attempts `Resume-BitLocker` **before** it asks for `RELAYOUT`. If that resume fails, Execute reports **BITLOCKER READINESS FAILED**, returns exit code `2`, and stops before the confirmation and before any disk-layout change.
 
 Only after BitLocker readiness passes and the user confirms `RELAYOUT` is the encrypted OS volume placed into a known one-reboot BitLocker suspension using:
 
