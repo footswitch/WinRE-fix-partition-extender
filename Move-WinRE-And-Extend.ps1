@@ -445,6 +445,23 @@ try {
         throw 'Failed to copy Winre.wim to the newly created recovery partition.'
     }
 
+    Write-Step 'Resetting REAgentC registration metadata'
+
+    # REAgentC can retain stale metadata that still associates WinRE with the
+    # BitLocker-protected OS volume even after /setreimage reports the new
+    # Recovery partition. Preserve the XML files, then force REAgentC to build
+    # fresh registration state from the new WinRE path.
+    $reAgentConfigDir = Join-Path $env:SystemRoot 'System32\Recovery'
+    foreach ($configName in @('ReAgent.xml', 'ReAgent_Merged.xml')) {
+        $configPath = Join-Path $reAgentConfigDir $configName
+        if (Test-Path -LiteralPath $configPath) {
+            Copy-Item -LiteralPath $configPath `
+                -Destination (Join-Path $backupDir ($configName + '.pre-register')) `
+                -Force
+            Remove-Item -LiteralPath $configPath -Force
+        }
+    }
+
     Write-Step 'Registering the WinRE image'
 
     Invoke-ReAgentC -Arguments @('/setreimage', '/path', $newWinREDir) | Out-Null
