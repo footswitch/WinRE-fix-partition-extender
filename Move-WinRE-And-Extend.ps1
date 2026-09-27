@@ -413,11 +413,14 @@ try {
 
     Write-Step 'Creating the new WinRE partition at the end of the disk'
 
-    # Create as basic data temporarily so a drive letter is guaranteed while
-    # we populate it. It is converted to the official Recovery type afterward.
+    # Create the partition as Microsoft Recovery from the outset. Do not create
+    # it as a Basic Data partition first: on systems with BitLocker/device-
+    # encryption policy, a newly mounted Basic Data volume can be classified as
+    # BitLocker-protected before we convert it, which makes REAgentC reject it.
     $newRecovery = New-Partition `
         -DiskNumber $disk.Number `
         -UseMaximumSize `
+        -GptType $RecoveryGptType `
         -AssignDriveLetter
 
     $newRecovery | Format-Volume `
@@ -466,16 +469,15 @@ try {
 
     Invoke-ReAgentC -Arguments @('/setreimage', '/path', $newWinREDir) | Out-Null
 
-    Write-Step 'Converting the new partition to the Microsoft Recovery type'
+    Write-Step 'Finalizing the Microsoft Recovery partition'
 
-    # WinRE must be on the dedicated Recovery partition before /enable is called,
-    # particularly on BitLocker-enabled systems. Remove the temporary letter,
-    # then apply Microsoft's Recovery GPT type and required attributes.
+    # The partition was created with the Recovery GUID from the outset. Remove
+    # its temporary drive letter and apply Microsoft's required GPT attributes
+    # before asking REAgentC to enable WinRE.
     Invoke-DiskPartScript -Commands @(
         "select disk $($disk.Number)"
         "select partition $($newRecovery.PartitionNumber)"
         "remove letter=$recoveryLetter"
-        "set id=$RecoveryGptTypeBare"
         'gpt attributes=0x8000000000000001'
         'exit'
     )
