@@ -64,7 +64,7 @@ Safety characteristics:
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
 - verifies the recreated WinRE partition and REAgentC configuration afterward.
 
-The Recovery partition size is user-selectable from **870 MB to 1100 MB**, with **1024 MB** as the default. The selected value is used as the final partition size. During execution the script checks the actual `Winre.wim` size plus servicing headroom; if the selected size is too small for that machine, it stops and reports the minimum required size instead of silently creating a larger partition.
+The Recovery partition size is user-selectable from **870 MB to 1100 MB**, with **1024 MB** as the default. The selected value is used as the final partition size. During execution the script verifies that the selected size can physically hold the current `Winre.wim` plus a small operational margin. If it cannot, the script stops instead of silently creating a larger partition. If the selected size leaves less than 250 MB above the WIM, the script warns that future servicing headroom is tighter but still honors the selected size.
 
 ### `Move-WinRE-And-Extend.bat`
 
