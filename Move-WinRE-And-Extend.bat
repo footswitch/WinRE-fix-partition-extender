@@ -56,7 +56,7 @@ echo       You will STILL have to type RELAYOUT in PowerShell
 echo       before any destructive action begins.
 echo.
 echo   [3] WinRE confirmation / recovery
-echo       Post-reboot validation of the final disk/WinRE state.
+echo       Post-reboot validation of disk, WinRE, and BitLocker state.
 echo       Repairs WinRE registration if needed.
 echo       This mode does NOT delete, create, shrink, or resize partitions.
 echo.
