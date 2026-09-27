@@ -430,6 +430,51 @@ function Write-BitLockerState {
     }
 }
 
+function Write-BitLockerReadinessDiagnostics {
+    param([char]$DriveLetter)
+
+    Write-Host ''
+    Write-Host 'BitLocker readiness diagnostics:' -ForegroundColor Cyan
+
+    try {
+        $bl = Get-BitLockerVolume -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop
+        $protectors = @($bl.KeyProtector)
+        if ($protectors.Count -eq 0) {
+            Write-Host '  Key protectors: none'
+        }
+        else {
+            foreach ($protector in $protectors) {
+                $protectorType = "$($protector.KeyProtectorType)"
+                $protectorId = "$($protector.KeyProtectorId)"
+                Write-Host ("  Protector: {0}  ID: {1}" -f $protectorType, $protectorId)
+            }
+        }
+    }
+    catch {
+        Write-Warning ("Could not enumerate BitLocker protector metadata: {0}" -f $_.Exception.Message)
+    }
+
+    $getTpm = Get-Command Get-Tpm -ErrorAction SilentlyContinue
+    if ($getTpm) {
+        try {
+            $tpm = Get-Tpm -ErrorAction Stop
+            Write-Host '  TPM status:'
+            Write-Host ("    Present:          {0}" -f $tpm.TpmPresent)
+            Write-Host ("    Ready:            {0}" -f $tpm.TpmReady)
+            Write-Host ("    Enabled:          {0}" -f $tpm.TpmEnabled)
+            Write-Host ("    Activated:        {0}" -f $tpm.TpmActivated)
+            Write-Host ("    Owned:            {0}" -f $tpm.TpmOwned)
+            Write-Host ("    Locked out:       {0}" -f $tpm.LockedOut)
+            Write-Host ("    Auto provisioning:{0}" -f $tpm.AutoProvisioning)
+        }
+        catch {
+            Write-Warning ("Could not query TPM state: {0}" -f $_.Exception.Message)
+        }
+    }
+    else {
+        Write-Host '  TPM status: Get-Tpm is not available on this system.'
+    }
+}
 function Ensure-BitLockerProtectedForExecute {
     param([char]$DriveLetter)
 
@@ -1364,6 +1409,8 @@ catch {
     Write-Host ''
     Write-Host 'BITLOCKER READINESS FAILED' -ForegroundColor Red
     Write-Warning $_.Exception.Message
+    Write-BitLockerReadinessDiagnostics -DriveLetter $osLetter
+    Write-Host ''
     Write-Host 'No RELAYOUT confirmation was requested.' -ForegroundColor Yellow
     Write-Host 'No disk layout change was attempted.' -ForegroundColor Yellow
     exit 2

@@ -90,8 +90,8 @@ echo PowerShell exit code: %RC%
 echo ------------------------------------------------------------
 echo.
 if "%RC%"=="2" (
-    echo WinRE needs confirmation/recovery before a new relayout.
-    echo Follow the recovery guidance shown above. Execute has not been started.
+    echo A recovery or safety precondition needs attention.
+    echo Follow the guidance shown above. No changes were made.
     echo.
 )
 pause
@@ -128,8 +128,8 @@ if "%RC%"=="0" (
     echo.
 )
 if "%RC%"=="2" (
-    echo Execute was blocked because WinRE needs confirmation/recovery first.
-    echo Follow the recovery guidance shown above. No relayout was started.
+    echo Execute was blocked by a recovery or safety precondition.
+    echo Follow the guidance shown above. No relayout was started.
     echo.
 )
 pause

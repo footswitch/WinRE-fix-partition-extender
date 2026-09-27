@@ -222,7 +222,7 @@ If the single Recovery candidate is correctly placed but too small for the retai
 
 If there is no Recovery partition, more than one candidate, no usable Winre.wim source, or unexpected partition geometry, the script stops cleanly and does not attempt partition changes. Option 3 remains non-destructive and does not create or resize partitions.
 
-The interrupted-state gate returns exit code `2`; the BAT launcher labels that code as recovery/confirmation required instead of presenting it as a successful Execute.
+Safety/precondition stops return exit code `2`. The BAT launcher treats that code generically as **recovery or safety attention required**, because it can represent an interrupted WinRE state, BitLocker readiness failure, or another precondition that deliberately blocks Execute before partition changes.
 
 ### WinRE confirmation / recovery
 
@@ -327,6 +327,8 @@ Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
 ```
 
 If protection was already suspended before Execute, the readiness phase resumes it and verifies that protection is `On`. If the user then confirms the operation, the script establishes the controlled one-reboot suspension. This avoids carrying an unknown or indefinite suspension forward from an earlier interrupted attempt; if the user cancels after readiness succeeds, BitLocker remains protected.
+
+If BitLocker readiness fails, the script prints non-secret diagnostics: key-protector **types and IDs** plus TPM availability/readiness when `Get-Tpm` is available. It deliberately does not print the 48-digit recovery password.
 
 After the required restart, **WinRE confirmation / recovery** checks BitLocker again. If the OS volume remains encrypted but protection is still `Off`, it attempts `Resume-BitLocker`. Final confirmation does not pass while an encrypted OS volume remains suspended.
 
