@@ -174,6 +174,43 @@ function Invoke-DiskPartScript {
     }
 }
 
+function Set-And-VerifyRecoveryPartitionMetadata {
+    param(
+        [Parameter(Mandatory)] [int]$DiskNumber,
+        [Parameter(Mandatory)] [int]$PartitionNumber
+    )
+
+    Invoke-DiskPartScript -Commands @(
+        "select disk $DiskNumber"
+        "select partition $PartitionNumber"
+        "set id=$RecoveryGptTypeBare"
+        'gpt attributes=0x8000000000000001'
+        'exit'
+    )
+
+    Set-Partition `
+        -DiskNumber $DiskNumber `
+        -PartitionNumber $PartitionNumber `
+        -NoDefaultDriveLetter $true `
+        -ErrorAction Stop
+
+    Start-Sleep -Milliseconds 500
+    $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+    $typeOk = "$($partition.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
+
+    if (-not $typeOk) {
+        throw "Recovery partition $PartitionNumber does not have the Microsoft Recovery GPT type after metadata finalization."
+    }
+    if (-not $partition.NoDefaultDriveLetter) {
+        throw "Recovery partition $PartitionNumber still does not have NoDefaultDriveLetter=True after metadata finalization."
+    }
+    if ($partition.DriveLetter) {
+        throw "Recovery partition $PartitionNumber still has drive letter $($partition.DriveLetter): after metadata finalization."
+    }
+
+    return $partition
+}
+
 function Get-WinRELocation {
     param([string]$InfoOutput)
 
@@ -863,12 +900,9 @@ function Invoke-WinRERollback {
         -AccessPath (("{0}:" -f $rollbackLetter)) `
         -ErrorAction Stop | Out-Null
 
-    Invoke-DiskPartScript -Commands @(
-        "select disk $DiskNumber"
-        "select partition $($restoredRecovery.PartitionNumber)"
-        'gpt attributes=0x8000000000000001'
-        'exit'
-    )
+    $restoredRecovery = Set-And-VerifyRecoveryPartitionMetadata `
+        -DiskNumber $DiskNumber `
+        -PartitionNumber $restoredRecovery.PartitionNumber
 
     $enableResult = Invoke-ReAgentC -Arguments @('/enable') -AllowFailure
 
@@ -876,8 +910,8 @@ function Invoke-WinRERollback {
     $sizeDifference = [math]::Abs([int64]$finalRecovery.Size - [int64]$OriginalRecoverySize)
     $typeOk = "$($finalRecovery.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
 
-    if (($sizeDifference -gt 1MB) -or (-not $typeOk) -or $finalRecovery.DriveLetter) {
-        throw 'Rollback recreated a Recovery partition, but its final size, GPT type, or drive-letter state does not match the original layout.'
+    if (($sizeDifference -gt 1MB) -or (-not $typeOk) -or $finalRecovery.DriveLetter -or (-not $finalRecovery.NoDefaultDriveLetter)) {
+        throw 'Rollback recreated a Recovery partition, but its final size, GPT type, drive-letter state, or NoDefaultDriveLetter attribute does not match the intended Recovery layout.'
     }
 
     Write-Host ''
@@ -1219,19 +1253,9 @@ Recovery mode will not download or synthesize a WinRE image.
         -AccessPath ("{0}:" -f $recoveryLetter) `
         -ErrorAction Stop | Out-Null
 
-    Invoke-DiskPartScript -Commands @(
-        "select disk $($disk.Number)"
-        "select partition $($recoveryPartition.PartitionNumber)"
-        "set id=$RecoveryGptTypeBare"
-        'gpt attributes=0x8000000000000001'
-        'exit'
-    )
-
-    Start-Sleep -Milliseconds 500
-    $recoveryPartition = Get-Partition -DiskNumber $disk.Number -PartitionNumber $recoveryPartition.PartitionNumber
-    if ($recoveryPartition.DriveLetter) {
-        throw "Recovery partition still has drive letter $($recoveryPartition.DriveLetter): after finalization."
-    }
+    $recoveryPartition = Set-And-VerifyRecoveryPartitionMetadata `
+        -DiskNumber $disk.Number `
+        -PartitionNumber $recoveryPartition.PartitionNumber
     Write-Step 'Enabling WinRE'
 
     $enableLog = Join-Path $repairBackupDir 'reagent-enable.log'
@@ -1902,18 +1926,11 @@ try {
         -AccessPath (("{0}:" -f $recoveryLetter)) `
         -ErrorAction Stop | Out-Null
 
-    Invoke-DiskPartScript -Commands @(
-        "select disk $($disk.Number)"
-        "select partition $($newRecovery.PartitionNumber)"
-        'gpt attributes=0x8000000000000001'
-        'exit'
-    )
+    $newRecovery = Set-And-VerifyRecoveryPartitionMetadata `
+        -DiskNumber $disk.Number `
+        -PartitionNumber $newRecovery.PartitionNumber
 
     Start-Sleep -Seconds 1
-    $newRecovery = Get-Partition -DiskNumber $disk.Number -PartitionNumber $newRecovery.PartitionNumber
-    if ($newRecovery.DriveLetter) {
-        throw "Recovery partition still has drive letter $($newRecovery.DriveLetter): after finalization."
-    }
 
     Write-Step 'Enabling WinRE'
     Invoke-ReAgentC -Arguments @('/enable') | Out-Null
@@ -1930,6 +1947,15 @@ try {
     $finalType = "$($finalRecovery.GptType)".Trim('{}').ToLowerInvariant()
     if ($finalType -ne $RecoveryGptTypeBare) {
         throw "Final recovery partition type is incorrect: $($finalRecovery.GptType)"
+    }
+    if ($finalRecovery.DriveLetter) {
+        throw "Final Recovery partition unexpectedly has drive letter $($finalRecovery.DriveLetter):."
+    }
+    if (-not $finalRecovery.NoDefaultDriveLetter) {
+        throw 'Final Recovery partition does not have NoDefaultDriveLetter=True.'
+    }
+    if (-not $finalRecovery.IsHidden) {
+        throw 'Final Recovery partition is not reported as hidden.'
     }
 
     $finalMatch = [regex]::Match(
