@@ -66,10 +66,12 @@ Safety characteristics:
 - if a fully encrypted volume is suspended, readiness attempts to restore protection before `RELAYOUT`;
 - the post-reboot confirmation only attempts `Resume-BitLocker` for a fully encrypted **Suspended** state, not for a volume that is disabled or being disabled;
 - preflights free space on the OS volume before changing WinRE or BitLocker state;
-- conservatively reserves room for both the temporary `Winre.wim` staging copy created by `reagentc /disable` and the independent rollback backup;
-- after WinRE is disabled and the actual `Winre.wim` size is known, performs a second exact free-space check before copying the rollback backup;
-- verifies the copied `Winre.wim` file size matches the staged source before any Recovery partition is deleted;
-- backs up `Winre.wim` before deleting the old Recovery partition;
+- conservatively reserves room for both the temporary `Winre.wim` staging copy that `reagentc /disable` may create and the independent rollback backup;
+- before disabling WinRE, temporarily exposes the registered Recovery partition, copies the active `Recovery\\WindowsRE\\Winre.wim` to the rollback directory, verifies its size, and removes the temporary access path again;
+- only then runs `reagentc /disable`, confirms `reagentc /info` reports WinRE as Disabled, and checks the normal `C:\\Windows\\System32\\Recovery\\Winre.wim` staging path;
+- if the staged image is unavailable but the pre-disable backup is verified, records detailed staging diagnostics and continues from the verified backup instead of deleting the Recovery partition without a usable image;
+- if the staged image exists, verifies its size matches the pre-disable backup before any Recovery partition is deleted;
+- backs up `Winre.wim` before any WinRE state change or partition-table change;
 - records the original Windows partition size, WinRE offset, and WinRE size before destructive work;
 - if a relayout fails after WinRE has been deleted, attempts to restore the original Windows partition size and recreate WinRE at its original offset and original size from the backup;
 - requires an explicit `RELAYOUT` confirmation before destructive work unless `-Force` is deliberately supplied;
@@ -181,15 +183,15 @@ The dry run displays:
 - the conservative backup/staging reserve;
 - whether the backup-space check passed.
 
-After `reagentc /disable` exposes the actual `Winre.wim`, the script checks again using the real WIM size. Before copying the rollback backup it requires:
+Before calling `reagentc /disable`, Execute temporarily assigns a drive letter to the currently registered Recovery partition and opens its active `Recovery\\WindowsRE\\Winre.wim` directly. It then performs an exact free-space check using:
 
 ```text
-actual Winre.wim size + 128 MB
+active Winre.wim size + 128 MB
 ```
 
-of remaining free space. If that second check fails, the script attempts to re-enable WinRE, removes the incomplete backup directory, and stops before deleting or resizing any partition.
+copies that image into the timestamped rollback directory, verifies the copied file length, and removes the temporary Recovery access path. If any of those steps fail, WinRE is still enabled and no partition-table change is attempted.
 
-After copying the backup, the script also verifies that the backup file length matches the source WIM before destructive work begins.
+After that verified backup exists, Execute prepares the REAgentC staging metadata, calls `reagentc /disable`, and verifies `reagentc /info` reports WinRE as Disabled. The normal staged path `C:\\Windows\\System32\\Recovery\\Winre.wim` is then checked with hidden/system-file access enabled. If it exists, its size must match the pre-disable backup. If it does not exist or cannot be accessed, Execute prints the underlying PowerShell error plus the visible contents of the staging directory and continues only from the already-verified pre-disable backup.
 
 ### Automatic rollback after a failed relayout
 
@@ -339,7 +341,7 @@ If readiness fails in the specific recoverable suspended state where a **Recover
 Microsoft documents that `Disable-BitLocker` removes key protectors and starts decryption. The utility therefore treats an in-progress user-requested decryption as **Disabling**, not as a suspended volume that should be resumed.
 ## Recovery backup
 
-Before deleting the old Recovery partition, the script disables WinRE and verifies that Windows has made `Winre.wim` available.
+Before disabling WinRE, the script copies and verifies the active `Winre.wim` directly from the registered Recovery partition. It then disables WinRE and validates the normal Windows staging path; failure of that staging copy no longer removes the only rollback source.
 
 It creates a timestamped backup directory on the Windows volume:
 

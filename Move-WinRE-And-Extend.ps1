@@ -246,6 +246,139 @@ function Set-And-VerifyRecoveryPartitionMetadata {
     Write-Host ("Verified Recovery GPT attributes: {0}" -f (Format-GptAttributes $rawAttributes))
     return $partition
 }
+
+function Backup-ActiveWinREImage {
+    param(
+        [Parameter(Mandatory)] [int]$DiskNumber,
+        [Parameter(Mandatory)] [int]$PartitionNumber,
+        [Parameter(Mandatory)] [char]$OsLetter,
+        [Parameter(Mandatory)] [string]$DestinationPath
+    )
+
+    $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+    $temporaryAccessPathAdded = $false
+    $recoveryLetter = $null
+
+    try {
+        if ($partition.DriveLetter) {
+            $recoveryLetter = [char]$partition.DriveLetter
+        }
+        else {
+            Add-PartitionAccessPath `
+                -DiskNumber $DiskNumber `
+                -PartitionNumber $PartitionNumber `
+                -AssignDriveLetter `
+                -ErrorAction Stop | Out-Null
+
+            Start-Sleep -Milliseconds 500
+            $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+
+            if (-not $partition.DriveLetter) {
+                throw 'Could not assign a temporary drive letter to the active Recovery partition.'
+            }
+
+            $recoveryLetter = [char]$partition.DriveLetter
+            $temporaryAccessPathAdded = $true
+        }
+
+        $sourcePath = Join-Path ("{0}:\" -f $recoveryLetter) 'Recovery\WindowsRE\Winre.wim'
+
+        try {
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction Stop
+        }
+        catch {
+            throw ("The active WinRE image could not be accessed directly before disabling WinRE. Path: {0}. Error: {1}" -f `
+                $sourcePath, $_.Exception.Message)
+        }
+
+        if ([uint64]$sourceItem.Length -lt 50MB) {
+            throw ("The active WinRE image is unexpectedly small ({0}): {1}" -f `
+                (Format-Bytes ([uint64]$sourceItem.Length)), $sourcePath)
+        }
+
+        $requiredBytes = [uint64]$sourceItem.Length + 128MB
+        $space = Assert-FreeSpace `
+            -DriveLetter $OsLetter `
+            -RequiredBytes $requiredBytes `
+            -Purpose 'pre-disable Winre.wim rollback backup'
+
+        Write-Host ("Active WinRE image:       {0}" -f $sourcePath)
+        Write-Host ("Active WinRE image size:  {0}" -f (Format-Bytes ([uint64]$sourceItem.Length)))
+        Write-Host ("Free space before backup: {0}" -f (Format-Bytes $space.FreeBytes))
+        Write-Host ("Backup copy requirement:  {0}" -f (Format-Bytes $space.RequiredBytes))
+
+        Copy-Item -LiteralPath $sourcePath -Destination $DestinationPath -Force -ErrorAction Stop
+
+        $backupItem = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop
+        if ($backupItem.Length -ne $sourceItem.Length) {
+            throw 'Pre-disable Winre.wim backup verification failed because the copied file size does not match the active source.'
+        }
+
+        Write-Host ("Verified pre-disable WinRE backup: {0}" -f $DestinationPath)
+
+        return [pscustomobject]@{
+            SourcePath = $sourcePath
+            BackupPath = $backupItem.FullName
+            Length     = [uint64]$backupItem.Length
+        }
+    }
+    finally {
+        if ($temporaryAccessPathAdded -and ($null -ne $recoveryLetter)) {
+            Remove-PartitionAccessPath `
+                -DiskNumber $DiskNumber `
+                -PartitionNumber $PartitionNumber `
+                -AccessPath ("{0}:" -f $recoveryLetter) `
+                -ErrorAction Stop | Out-Null
+
+            Start-Sleep -Milliseconds 500
+            $partitionAfter = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
+            if ($partitionAfter.DriveLetter) {
+                throw "The active Recovery partition still has temporary drive letter $($partitionAfter.DriveLetter): after the pre-disable backup."
+            }
+        }
+    }
+}
+
+function Clear-WinREImageLocationStagingMetadata {
+    param(
+        [Parameter(Mandatory)] [string]$ReAgentXmlPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ReAgentXmlPath)) {
+        Write-Warning "ReAgent.xml was not found at $ReAgentXmlPath; no staging metadata was cleared."
+        return $false
+    }
+
+    [xml]$xml = Get-Content -LiteralPath $ReAgentXmlPath -Raw -ErrorAction Stop
+    $node = $xml.WindowsRE.ImageLocation
+
+    if ($null -eq $node) {
+        Write-Warning 'ReAgent.xml has no WindowsRE/ImageLocation node; no staging metadata was cleared.'
+        return $false
+    }
+
+    $emptyGuid = '{00000000-0000-0000-0000-000000000000}'
+    $alreadyClear = `
+        ("$($node.path)" -eq '') -and `
+        ("$($node.guid)" -eq $emptyGuid) -and `
+        ("$($node.offset)" -eq '0') -and `
+        ("$($node.id)" -eq '0')
+
+    if ($alreadyClear) {
+        Write-Host 'ReAgent.xml ImageLocation staging metadata is already clear.'
+        return $false
+    }
+
+    $node.SetAttribute('path', '')
+    $node.SetAttribute('offset', '0')
+    $node.SetAttribute('guid', $emptyGuid)
+    $node.SetAttribute('id', '0')
+    $xml.Save($ReAgentXmlPath)
+
+    Write-Host 'Cleared ReAgent.xml ImageLocation staging metadata before disabling WinRE.'
+    return $true
+}
+
 function Get-WinRELocation {
     param([string]$InfoOutput)
 
@@ -1897,6 +2030,8 @@ $originalOSSize = [uint64]$osPartition.Size
 $originalRecoveryOffset = [uint64]$recoveryPartition.Offset
 $originalRecoverySize = [uint64]$recoveryPartition.Size
 $rollbackBackupWimPath = Join-Path $backupDir 'Winre.wim'
+$winreDisableAttemptedByExecution = $false
+$defaultStagedWinreWimPath = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
 
 try {
     Write-Step 'Creating a local WinRE backup directory'
@@ -1911,54 +2046,113 @@ try {
         Write-Step 'Using the retained WinRE image from the interrupted relayout'
         $winreWim = $interruptedWimPath
         $winreWimItem = Get-Item -LiteralPath $winreWim -Force -ErrorAction Stop
-    }
-    else {
-        Write-Step 'Disabling WinRE'
-        Invoke-ReAgentC -Arguments @('/disable') | Out-Null
 
-        $winreWim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
-        try {
-            $winreWimItem = Get-Item -LiteralPath $winreWim -Force -ErrorAction Stop
-        }
-        catch {
-            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
-            throw "WinRE was disabled, but $winreWim could not be accessed. The old recovery partition has NOT been deleted."
-        }
-    }
-
-    $exactBackupRequired = [uint64]$winreWimItem.Length + 128MB
-    try {
+        $exactBackupRequired = [uint64]$winreWimItem.Length + 128MB
         $exactBackupSpace = Assert-FreeSpace `
             -DriveLetter $osLetter `
             -RequiredBytes $exactBackupRequired `
             -Purpose 'Winre.wim rollback backup'
+
+        Write-Host ("Free space before backup: {0}" -f (Format-Bytes $exactBackupSpace.FreeBytes))
+        Write-Host ("Backup copy requirement:   {0}" -f (Format-Bytes $exactBackupSpace.RequiredBytes))
+
+        try {
+            Copy-Item -LiteralPath $winreWim -Destination $rollbackBackupWimPath -Force -ErrorAction Stop
+            $backupWimItem = Get-Item -LiteralPath $rollbackBackupWimPath -Force -ErrorAction Stop
+            if ($backupWimItem.Length -ne $winreWimItem.Length) {
+                throw 'Copied Winre.wim size does not match the source.'
+            }
+        }
+        catch {
+            $backupFailure = $_.Exception.Message
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            throw ("Winre.wim backup copy/verification failed before any partition change: {0}" -f $backupFailure)
+        }
     }
-    catch {
-        if (-not $interruptedRelayout) {
+    else {
+        Write-Step 'Backing up the active WinRE image before disabling WinRE'
+        try {
+            $preDisableBackup = Backup-ActiveWinREImage `
+                -DiskNumber $disk.Number `
+                -PartitionNumber $recoveryPartition.PartitionNumber `
+                -OsLetter $osLetter `
+                -DestinationPath $rollbackBackupWimPath
+        }
+        catch {
+            $backupFailure = $_.Exception.Message
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            throw ("Could not create a verified WinRE backup before disabling WinRE: {0}" -f $backupFailure)
+        }
+
+        $backupWimItem = Get-Item -LiteralPath $preDisableBackup.BackupPath -Force -ErrorAction Stop
+
+        Write-Step 'Preparing REAgentC staging metadata'
+        Clear-WinREImageLocationStagingMetadata -ReAgentXmlPath $reAgentXml | Out-Null
+
+        Write-Step 'Disabling WinRE'
+        $winreDisableAttemptedByExecution = $true
+        Invoke-ReAgentC -Arguments @('/disable') | Out-Null
+
+        $disabledInfo = Invoke-ReAgentC -Arguments @('/info') -AllowFailure
+        $disabledStateConfirmed = `
+            ($disabledInfo.ExitCode -eq 0) -and `
+            ($disabledInfo.Output -match '(?im)Windows RE status:\s*Disabled')
+
+        if (-not $disabledStateConfirmed) {
             Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+            throw 'REAgentC /disable returned success, but a subsequent REAgentC /info did not confirm Windows RE status: Disabled. The old Recovery partition has NOT been deleted.'
         }
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-        throw
-    }
 
-    Write-Host ("Free space before backup: {0}" -f (Format-Bytes $exactBackupSpace.FreeBytes))
-    Write-Host ("Backup copy requirement:   {0}" -f (Format-Bytes $exactBackupSpace.RequiredBytes))
+        $stagedWinreWim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
+        $stagedWimItem = $null
+        $stagingAccessError = $null
 
-    try {
-        Copy-Item -LiteralPath $winreWim -Destination (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
-
-        $backupWimItem = Get-Item -LiteralPath (Join-Path $backupDir 'Winre.wim') -Force -ErrorAction Stop
-        if ($backupWimItem.Length -ne $winreWimItem.Length) {
-            throw 'Copied Winre.wim size does not match the source.'
+        try {
+            $stagedWimItem = Get-Item -LiteralPath $stagedWinreWim -Force -ErrorAction Stop
         }
-    }
-    catch {
-        $backupFailure = $_.Exception.Message
-        if (-not $interruptedRelayout) {
-            Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+        catch {
+            $stagingAccessError = $_.Exception.Message
         }
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-        throw ("Winre.wim backup copy/verification failed before any partition change: {0}" -f $backupFailure)
+
+        if ($null -ne $stagedWimItem) {
+            if ($stagedWimItem.Length -ne $backupWimItem.Length) {
+                Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
+                throw ("REAgentC staged Winre.wim, but its size ({0}) does not match the verified pre-disable backup ({1}). The old Recovery partition has NOT been deleted." -f `
+                    (Format-Bytes ([uint64]$stagedWimItem.Length)),
+                    (Format-Bytes ([uint64]$backupWimItem.Length)))
+            }
+
+            $winreWim = $stagedWinreWim
+            $winreWimItem = $stagedWimItem
+            Write-Host ("Verified REAgentC staged Winre.wim: {0}" -f $stagedWinreWim)
+        }
+        else {
+            Write-Warning 'REAgentC /disable succeeded and WinRE is confirmed Disabled, but the normal staged Winre.wim could not be accessed.'
+            Write-Warning ("Staging path: {0}" -f $stagedWinreWim)
+            Write-Warning ("PowerShell access error: {0}" -f $stagingAccessError)
+
+            $stagingDirectory = Split-Path -Parent $stagedWinreWim
+            try {
+                $stagingEntries = @(Get-ChildItem -LiteralPath $stagingDirectory -Force -ErrorAction Stop)
+                if ($stagingEntries.Count -eq 0) {
+                    Write-Warning 'The WinRE staging directory is accessible but contains no files.'
+                }
+                else {
+                    Write-Warning 'Files currently visible in the WinRE staging directory:'
+                    foreach ($entry in $stagingEntries) {
+                        $lengthText = if ($entry.PSIsContainer) { '<DIR>' } else { Format-Bytes ([uint64]$entry.Length) }
+                        Write-Warning ("  {0}  {1}  [{2}]" -f $entry.Name, $lengthText, $entry.Attributes)
+                    }
+                }
+            }
+            catch {
+                Write-Warning ("The WinRE staging directory itself could not be enumerated: {0}" -f $_.Exception.Message)
+            }
+
+            Write-Warning 'Continuing with the independently verified pre-disable WinRE backup instead of relying on REAgentC staging.'
+            $winreWim = $rollbackBackupWimPath
+            $winreWimItem = $backupWimItem
+        }
     }
     # Honor the explicitly selected final partition size. Require enough room
     # for Winre.wim plus a small operational margin, but do not silently enlarge
@@ -2252,6 +2446,32 @@ catch {
     }
     else {
         Write-Warning 'No partition-table change had occurred before the failure.'
+
+        if ($winreDisableAttemptedByExecution -and (Test-Path -LiteralPath $rollbackBackupWimPath)) {
+            $stagedImageAccessible = $false
+            try {
+                Get-Item -LiteralPath $defaultStagedWinreWimPath -Force -ErrorAction Stop | Out-Null
+                $stagedImageAccessible = $true
+            }
+            catch {
+            }
+
+            if (-not $stagedImageAccessible) {
+                Write-Warning 'The default WinRE staging image is not accessible. Restoring the verified backup to the default staging path before re-enabling WinRE.'
+                try {
+                    Copy-Item -LiteralPath $rollbackBackupWimPath -Destination $defaultStagedWinreWimPath -Force -ErrorAction Stop
+                    $restoredStagedWim = Get-Item -LiteralPath $defaultStagedWinreWimPath -Force -ErrorAction Stop
+                    $rollbackWim = Get-Item -LiteralPath $rollbackBackupWimPath -Force -ErrorAction Stop
+                    if ($restoredStagedWim.Length -ne $rollbackWim.Length) {
+                        throw 'Restored staging Winre.wim size does not match the verified rollback backup.'
+                    }
+                }
+                catch {
+                    Write-Warning ("Could not restore the default WinRE staging image from the verified backup: {0}" -f $_.Exception.Message)
+                }
+            }
+        }
+
         Write-Warning 'Attempting to leave WinRE enabled if Windows can do so...'
         try {
             Invoke-ReAgentC -Arguments @('/enable') -AllowFailure | Out-Null
