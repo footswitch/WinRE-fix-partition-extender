@@ -846,14 +846,26 @@ function Invoke-WinRERollback {
     $rollbackLetter = [char]$restoredRecovery.DriveLetter
     $rollbackWinREDir = Join-Path ("{0}:\" -f $rollbackLetter) 'Recovery\WindowsRE'
     New-Item -ItemType Directory -Path $rollbackWinREDir -Force | Out-Null
-    Copy-Item -LiteralPath $BackupWimPath -Destination (Join-Path $rollbackWinREDir 'Winre.wim') -Force
+    $rollbackWimPath = Join-Path $rollbackWinREDir 'Winre.wim'
+    Copy-Item -LiteralPath $BackupWimPath -Destination $rollbackWimPath -Force -ErrorAction Stop
+
+    $rollbackSourceWim = Get-Item -LiteralPath $BackupWimPath -Force -ErrorAction Stop
+    $rollbackCopiedWim = Get-Item -LiteralPath $rollbackWimPath -Force -ErrorAction Stop
+    if ($rollbackCopiedWim.Length -ne $rollbackSourceWim.Length) {
+        throw 'Rollback Winre.wim copy size does not match the backup source.'
+    }
 
     $setResult = Invoke-ReAgentC -Arguments @('/setreimage', '/path', $rollbackWinREDir) -AllowFailure
+
+    Remove-PartitionAccessPath `
+        -DiskNumber $DiskNumber `
+        -PartitionNumber $restoredRecovery.PartitionNumber `
+        -AccessPath (("{0}:" -f $rollbackLetter)) `
+        -ErrorAction Stop | Out-Null
 
     Invoke-DiskPartScript -Commands @(
         "select disk $DiskNumber"
         "select partition $($restoredRecovery.PartitionNumber)"
-        "remove letter=$rollbackLetter noerr"
         'gpt attributes=0x8000000000000001'
         'exit'
     )
@@ -864,8 +876,8 @@ function Invoke-WinRERollback {
     $sizeDifference = [math]::Abs([int64]$finalRecovery.Size - [int64]$OriginalRecoverySize)
     $typeOk = "$($finalRecovery.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
 
-    if (($sizeDifference -gt 1MB) -or (-not $typeOk)) {
-        throw 'Rollback recreated a Recovery partition, but its final size or GPT type does not match the original layout.'
+    if (($sizeDifference -gt 1MB) -or (-not $typeOk) -or $finalRecovery.DriveLetter) {
+        throw 'Rollback recreated a Recovery partition, but its final size, GPT type, or drive-letter state does not match the original layout.'
     }
 
     Write-Host ''
@@ -1849,12 +1861,14 @@ try {
     $newWinREDir = Join-Path $newRecoveryRoot 'Recovery\WindowsRE'
 
     New-Item -ItemType Directory -Path $newWinREDir -Force | Out-Null
-    Copy-Item -LiteralPath $winreWim -Destination (Join-Path $newWinREDir 'Winre.wim') -Force
-
     $copiedWim = Join-Path $newWinREDir 'Winre.wim'
-    if (-not (Test-Path -LiteralPath $copiedWim)) {
-        throw 'Failed to copy Winre.wim to the newly created recovery partition.'
+    Copy-Item -LiteralPath $winreWim -Destination $copiedWim -Force -ErrorAction Stop
+
+    $copiedWimItem = Get-Item -LiteralPath $copiedWim -Force -ErrorAction Stop
+    if ($copiedWimItem.Length -ne $winreWimItem.Length) {
+        throw 'Copied Winre.wim size on the new Recovery partition does not match the source.'
     }
+    Write-Host ("Verified Recovery Winre.wim: {0}" -f (Format-Bytes $copiedWimItem.Length))
 
     Write-Step 'Resetting REAgentC registration metadata'
 
@@ -1879,18 +1893,27 @@ try {
 
     Write-Step 'Finalizing the Microsoft Recovery partition'
 
-    # The partition was created with the Recovery GUID from the outset. Remove
-    # its temporary drive letter and apply Microsoft's required GPT attributes
-    # before asking REAgentC to enable WinRE.
+    # Remove the temporary drive-letter access path with the Storage cmdlet so
+    # a failure is surfaced as a terminating error instead of being hidden by
+    # DiskPart's process exit code. Then apply the required GPT attributes.
+    Remove-PartitionAccessPath `
+        -DiskNumber $disk.Number `
+        -PartitionNumber $newRecovery.PartitionNumber `
+        -AccessPath (("{0}:" -f $recoveryLetter)) `
+        -ErrorAction Stop | Out-Null
+
     Invoke-DiskPartScript -Commands @(
         "select disk $($disk.Number)"
         "select partition $($newRecovery.PartitionNumber)"
-        "remove letter=$recoveryLetter"
         'gpt attributes=0x8000000000000001'
         'exit'
     )
 
     Start-Sleep -Seconds 1
+    $newRecovery = Get-Partition -DiskNumber $disk.Number -PartitionNumber $newRecovery.PartitionNumber
+    if ($newRecovery.DriveLetter) {
+        throw "Recovery partition still has drive letter $($newRecovery.DriveLetter): after finalization."
+    }
 
     Write-Step 'Enabling WinRE'
     Invoke-ReAgentC -Arguments @('/enable') | Out-Null
