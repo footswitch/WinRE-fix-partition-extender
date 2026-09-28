@@ -421,6 +421,10 @@ function Get-BitLockerState {
             LockStatus           = 'Unknown'
             EncryptionPercentage = $null
             IsEncrypted          = $null
+            LifecycleState       = 'Unknown'
+            IsFullyDecrypted     = $null
+            IsFullyEncrypted     = $null
+            IsTransitioning      = $null
             KeyProtectorCount    = $null
             KeyProtectorTypes    = @()
         }
@@ -429,7 +433,26 @@ function Get-BitLockerState {
     try {
         $bl = Get-BitLockerVolume -MountPoint (("{0}:" -f $DriveLetter)) -ErrorAction Stop
         $volumeStatus = "$($bl.VolumeStatus)"
-        $isEncrypted = $volumeStatus -ne 'FullyDecrypted'
+        $protectionStatus = "$($bl.ProtectionStatus)"
+        $isFullyDecrypted = $volumeStatus -eq 'FullyDecrypted'
+        $isFullyEncrypted = $volumeStatus -eq 'FullyEncrypted'
+        $isTransitioning = @('EncryptionInProgress', 'DecryptionInProgress', 'EncryptionPaused', 'DecryptionPaused') -contains $volumeStatus
+        $isEncrypted = -not $isFullyDecrypted
+
+        $lifecycleState = switch ($volumeStatus) {
+            'FullyDecrypted' { 'Disabled'; break }
+            'FullyEncrypted' {
+                if ($protectionStatus -eq 'On') { 'Protected' }
+                elseif ($protectionStatus -eq 'Off') { 'Suspended' }
+                else { 'Unknown' }
+                break
+            }
+            'DecryptionInProgress' { 'Disabling'; break }
+            'DecryptionPaused' { 'Disabling'; break }
+            'EncryptionInProgress' { 'Enabling'; break }
+            'EncryptionPaused' { 'Enabling'; break }
+            default { 'Unknown' }
+        }
 
         $keyProtectors = @($bl.KeyProtector)
         $keyProtectorTypes = @(
@@ -442,10 +465,14 @@ function Get-BitLockerState {
             Available            = $true
             DriveLetter          = $DriveLetter
             VolumeStatus         = $volumeStatus
-            ProtectionStatus     = "$($bl.ProtectionStatus)"
+            ProtectionStatus     = $protectionStatus
             LockStatus           = "$($bl.LockStatus)"
             EncryptionPercentage = $bl.EncryptionPercentage
             IsEncrypted          = $isEncrypted
+            LifecycleState       = $lifecycleState
+            IsFullyDecrypted     = $isFullyDecrypted
+            IsFullyEncrypted     = $isFullyEncrypted
+            IsTransitioning      = $isTransitioning
             KeyProtectorCount    = $keyProtectors.Count
             KeyProtectorTypes    = $keyProtectorTypes
         }
@@ -460,6 +487,10 @@ function Get-BitLockerState {
             LockStatus           = 'Unknown'
             EncryptionPercentage = $null
             IsEncrypted          = $null
+            LifecycleState       = 'Unknown'
+            IsFullyDecrypted     = $null
+            IsFullyEncrypted     = $null
+            IsTransitioning      = $null
             KeyProtectorCount    = $null
             KeyProtectorTypes    = @()
         }
@@ -480,9 +511,23 @@ function Write-BitLockerState {
 
     Write-Host ("{0} volume status:     {1}" -f $Prefix, $State.VolumeStatus)
     Write-Host ("{0} protection:        {1}" -f $Prefix, $State.ProtectionStatus)
+    Write-Host ("{0} lifecycle:         {1}" -f $Prefix, $State.LifecycleState)
     Write-Host ("{0} lock status:       {1}" -f $Prefix, $State.LockStatus)
     if ($null -ne $State.EncryptionPercentage) {
         Write-Host ("{0} encrypted:         {1}%" -f $Prefix, $State.EncryptionPercentage)
+    }
+
+    if ($State.LifecycleState -eq 'Disabled') {
+        Write-Host 'BitLocker is fully decrypted/disabled and will be left disabled.' -ForegroundColor Green
+        return
+    }
+    if ($State.LifecycleState -eq 'Disabling') {
+        Write-Warning 'BitLocker decryption is still in progress or paused. The script will not re-enable or resume BitLocker.'
+        return
+    }
+    if ($State.LifecycleState -eq 'Enabling') {
+        Write-Warning 'BitLocker encryption is still in progress or paused. The script will not modify BitLocker while conversion is incomplete.'
+        return
     }
 
     if ($State.IsEncrypted) {
@@ -571,13 +616,8 @@ function Get-BitLockerTpmRepairAssessment {
         return [pscustomobject]$result
     }
 
-    if (-not $state.IsEncrypted) {
-        $result.Reason = 'The OS volume is not BitLocker-encrypted.'
-        return [pscustomobject]$result
-    }
-
-    if ($state.ProtectionStatus -ne 'Off') {
-        $result.Reason = 'BitLocker protection is not suspended.'
+    if ($state.LifecycleState -ne 'Suspended') {
+        $result.Reason = ("BitLocker lifecycle state is {0}, not Suspended." -f $state.LifecycleState)
         return [pscustomobject]$result
     }
 
@@ -732,18 +772,30 @@ function Ensure-BitLockerProtectedForExecute {
         throw 'BitLocker state could not be verified. Refusing to continue to RELAYOUT confirmation.'
     }
 
-    if (-not $state.IsEncrypted) {
-        Write-Host 'BitLocker is not enabled on the OS volume; no readiness action is required.'
+    if ($state.LifecycleState -eq 'Disabled') {
+        Write-Host 'BitLocker is fully disabled/decrypted. It will remain disabled.' -ForegroundColor Green
         return $state
+    }
+
+    if ($state.LifecycleState -eq 'Disabling') {
+        throw 'BitLocker is currently being disabled/decrypted. Wait until VolumeStatus is FullyDecrypted before Execute. The script will not resume or re-enable BitLocker.'
+    }
+
+    if ($state.LifecycleState -eq 'Enabling') {
+        throw 'BitLocker encryption is still in progress or paused. Wait until VolumeStatus is FullyEncrypted before Execute.'
+    }
+
+    if ($state.LifecycleState -eq 'Protected') {
+        Write-Host 'BitLocker protection is already On.' -ForegroundColor Green
+        return $state
+    }
+
+    if ($state.LifecycleState -ne 'Suspended') {
+        throw ("BitLocker is in an unsupported/unknown lifecycle state: {0}. Refusing to continue." -f $state.LifecycleState)
     }
 
     if ($state.KeyProtectorCount -eq 0) {
-        throw 'The OS volume is encrypted but has no configured BitLocker key protectors. Refusing to continue to RELAYOUT confirmation.'
-    }
-
-    if ($state.ProtectionStatus -eq 'On') {
-        Write-Host 'BitLocker protection is already On.' -ForegroundColor Green
-        return $state
+        throw 'The OS volume is fully encrypted but suspended and has no configured BitLocker key protectors. Refusing to continue to RELAYOUT confirmation.'
     }
 
     Write-Warning 'BitLocker protection is currently suspended.'
@@ -771,20 +823,20 @@ function Set-BitLockerKnownOneRebootSuspension {
         throw 'BitLocker state could not be verified. Refusing to start partition changes.'
     }
 
-    if (-not $state.IsEncrypted) {
-        Write-Host 'BitLocker is not enabled on the OS volume; no suspension is required.'
+    if ($state.LifecycleState -eq 'Disabled') {
+        Write-Host 'BitLocker is fully disabled/decrypted; no suspension is required and it will remain disabled.'
         return $state
     }
 
+    if ($state.LifecycleState -in @('Disabling', 'Enabling')) {
+        throw ("BitLocker conversion is incomplete ({0}). Refusing to start partition changes." -f $state.VolumeStatus)
+    }
+
+    if ($state.LifecycleState -ne 'Protected') {
+        throw ("BitLocker must be either Disabled or Protected before partition changes. Current lifecycle state: {0}." -f $state.LifecycleState)
+    }
+
     $mountPoint = ("{0}:" -f $DriveLetter)
-
-    if ($state.KeyProtectorCount -eq 0) {
-        throw 'The OS volume is encrypted but has no configured BitLocker key protectors. Refusing to change partitions until BitLocker protection is repaired.'
-    }
-
-    if ($state.ProtectionStatus -ne 'On') {
-        throw 'BitLocker protection is not On immediately before the controlled suspension. Refusing to start partition changes.'
-    }
 
     Suspend-BitLocker -MountPoint $mountPoint -RebootCount 1 -ErrorAction Stop | Out-Null
     $after = Get-BitLockerState -DriveLetter $DriveLetter
@@ -807,12 +859,24 @@ function Ensure-BitLockerResumedForFinalConfirmation {
         return [pscustomobject]@{ State = $state; Issue = 'BitLocker state could not be verified.' }
     }
 
-    if (-not $state.IsEncrypted) {
+    if ($state.LifecycleState -eq 'Disabled') {
         return [pscustomobject]@{ State = $state; Issue = $null }
     }
 
-    if ($state.ProtectionStatus -eq 'On') {
+    if ($state.LifecycleState -eq 'Disabling') {
+        return [pscustomobject]@{ State = $state; Issue = 'BitLocker is being disabled/decrypted. The script will not resume it. Wait until VolumeStatus is FullyDecrypted, then run confirmation again.' }
+    }
+
+    if ($state.LifecycleState -eq 'Enabling') {
+        return [pscustomobject]@{ State = $state; Issue = 'BitLocker encryption is still in progress or paused. Wait until VolumeStatus is FullyEncrypted, then run confirmation again.' }
+    }
+
+    if ($state.LifecycleState -eq 'Protected') {
         return [pscustomobject]@{ State = $state; Issue = $null }
+    }
+
+    if ($state.LifecycleState -ne 'Suspended') {
+        return [pscustomobject]@{ State = $state; Issue = ("BitLocker is in an unsupported/unknown lifecycle state: {0}." -f $state.LifecycleState) }
     }
 
     if ($state.KeyProtectorCount -eq 0) {
@@ -1654,14 +1718,21 @@ if ($interruptedRelayout) {
     Write-Warning 'Because the current Recovery partition is undersized, this repair requires a partition-table change rather than option 3.'
 }
 
-$bitLockerBlocksExecute = ($bitLockerPreflight.Available -and $bitLockerPreflight.IsEncrypted -and ($bitLockerPreflight.KeyProtectorCount -eq 0))
-$bitLockerNeedsResume = ($bitLockerPreflight.Available -and $bitLockerPreflight.IsEncrypted -and ($bitLockerPreflight.ProtectionStatus -eq 'Off'))
+$bitLockerBlocksExecute = ($bitLockerPreflight.Available -and ($bitLockerPreflight.LifecycleState -eq 'Suspended') -and ($bitLockerPreflight.KeyProtectorCount -eq 0))
+$bitLockerNeedsResume = ($bitLockerPreflight.Available -and ($bitLockerPreflight.LifecycleState -eq 'Suspended'))
+$bitLockerTransitioning = ($bitLockerPreflight.Available -and ($bitLockerPreflight.LifecycleState -in @('Disabling', 'Enabling')))
 if ($bitLockerBlocksExecute) {
     Write-Warning 'Execute is currently blocked because the encrypted OS volume has no configured BitLocker key protectors.'
     Write-Warning 'Inspect and restore an appropriate BitLocker protector before attempting the relayout.'
 }
+elseif ($bitLockerTransitioning) {
+    Write-Warning ("BitLocker conversion is incomplete: {0}. Execute is blocked until conversion reaches a stable state." -f $bitLockerPreflight.VolumeStatus)
+    if ($bitLockerPreflight.LifecycleState -eq 'Disabling') {
+        Write-Warning 'The script will not resume or re-enable BitLocker; wait until it is FullyDecrypted.'
+    }
+}
 elseif ($bitLockerNeedsResume) {
-    Write-Warning 'BitLocker protection is suspended. Execute will attempt to resume protection before asking for RELAYOUT confirmation.'
+    Write-Warning 'BitLocker is fully encrypted but suspended. Execute will attempt to resume protection before asking for RELAYOUT confirmation.'
     Write-Warning 'If BitLocker cannot be resumed, Execute will stop before any partition change.'
 }
 
@@ -1674,6 +1745,16 @@ if (-not $Execute) {
             Write-Host 'NEXT STEP:' -ForegroundColor Yellow
             Write-Host '  Repair/restore the BitLocker key-protector configuration first.'
             Write-Host '  Execute will refuse to modify partitions until BitLocker can be protected again.'
+        }
+        elseif ($bitLockerTransitioning) {
+            Write-Host 'NEXT STEP:' -ForegroundColor Yellow
+            if ($bitLockerPreflight.LifecycleState -eq 'Disabling') {
+                Write-Host '  Wait for BitLocker decryption to finish (VolumeStatus = FullyDecrypted).'
+                Write-Host '  The script will leave BitLocker disabled and will not attempt to resume it.'
+            }
+            else {
+                Write-Host '  Wait for BitLocker encryption to reach FullyEncrypted before Execute.'
+            }
         }
         else {
             Write-Host 'NEXT STEPS:' -ForegroundColor Yellow
@@ -1698,14 +1779,13 @@ if (-not $Execute) {
 DRY RUN ONLY - no changes were made.
 
 REQUIRED NEXT STEPS:
-  1. Restart Windows.
-  2. Run Move-WinRE-And-Extend.bat again.
-  3. Choose Execute.
-  4. Select the desired Recovery partition size again.
-  5. Type RELAYOUT when prompted.
+  1. Run Move-WinRE-And-Extend.bat again.
+  2. Choose Execute.
+  3. Select the desired Recovery partition size again.
+  4. Type RELAYOUT when prompted.
 
 AFTER EXECUTE COMPLETES:
-  1. Restart Windows again.
+  1. Restart Windows for post-reboot WinRE validation.
   2. Run Move-WinRE-And-Extend.bat.
   3. Choose WinRE confirmation / recovery.
   4. Do not consider the operation complete until that option reports that
@@ -1715,7 +1795,15 @@ AFTER EXECUTE COMPLETES:
 }
 
 if ($bitLockerBlocksExecute) {
-    Write-Warning 'Execute is blocked before confirmation because BitLocker has no configured key protectors.'
+    Write-Warning 'Execute is blocked before confirmation because suspended BitLocker has no configured key protectors.'
+    Write-Host 'No changes were made.' -ForegroundColor Yellow
+    exit 2
+}
+if ($bitLockerTransitioning) {
+    Write-Warning ("Execute is blocked while BitLocker conversion is incomplete: {0}." -f $bitLockerPreflight.VolumeStatus)
+    if ($bitLockerPreflight.LifecycleState -eq 'Disabling') {
+        Write-Warning 'Wait until BitLocker is FullyDecrypted. The script will not reverse the user-requested decryption.'
+    }
     Write-Host 'No changes were made.' -ForegroundColor Yellow
     exit 2
 }
@@ -2097,12 +2185,17 @@ try {
     Write-Host ("WinRE partition is now:   {0} (partition {1})" -f `
         (Format-Bytes $finalRecovery.Size), $finalRecovery.PartitionNumber)
     Write-Host ("WinRE backup retained at: {0}" -f $backupDir)
-    if ($bitLockerExecutionState.Available -and $bitLockerExecutionState.IsEncrypted) {
-        Write-Host 'BitLocker:                suspended for one reboot'
+    if ($bitLockerExecutionState.Available) {
+        if ($bitLockerExecutionState.LifecycleState -eq 'Disabled') {
+            Write-Host 'BitLocker:                disabled / fully decrypted (left unchanged)'
+        }
+        elseif ($bitLockerExecutionState.IsEncrypted) {
+            Write-Host 'BitLocker:                suspended for one reboot'
+        }
     }
     Write-Host ''
     Write-Host 'REQUIRED NEXT STEPS:' -ForegroundColor Yellow
-    Write-Host '  1. Restart Windows.'
+    Write-Host '  1. Restart Windows for post-reboot WinRE validation.'
     Write-Host '  2. Run Move-WinRE-And-Extend.bat.'
     Write-Host '  3. Choose WinRE confirmation / recovery.'
     Write-Host '  4. Do not delete the backup directory until that option reports:'
