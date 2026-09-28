@@ -59,10 +59,12 @@ Safety characteristics:
 - does not assume Disk 0;
 - GPT-only;
 - refuses unsupported partition geometry rather than guessing;
-- detects the OS volume's full BitLocker state (encryption status and protection status);
-- when the OS volume is BitLocker-encrypted, establishes a known **one-reboot suspension** immediately before partition changes;
-- if BitLocker was already suspended, briefly resumes it and then re-suspends with `-RebootCount 1` so the expected resume point is known;
-- the post-reboot confirmation verifies BitLocker protection is back **On**; if it is still suspended, the confirmation mode attempts `Resume-BitLocker` and will not declare final success until protection is restored;
+- classifies the OS volume's BitLocker lifecycle as fully disabled/decrypted, protected, suspended, enabling, disabling, or unknown;
+- leaves a **FullyDecrypted** OS volume disabled and never enables BitLocker on the user's behalf;
+- blocks Execute while encryption or decryption is still in progress/paused instead of trying to reverse that transition;
+- when the OS volume is fully encrypted and protected, establishes a known **one-reboot suspension** immediately before partition changes;
+- if a fully encrypted volume is suspended, readiness attempts to restore protection before `RELAYOUT`;
+- the post-reboot confirmation only attempts `Resume-BitLocker` for a fully encrypted **Suspended** state, not for a volume that is disabled or being disabled;
 - preflights free space on the OS volume before changing WinRE or BitLocker state;
 - conservatively reserves room for both the temporary `Winre.wim` staging copy created by `reagentc /disable` and the independent rollback backup;
 - after WinRE is disabled and the actual `Winre.wim` size is known, performs a second exact free-space check before copying the rollback backup;
@@ -140,17 +142,16 @@ Review the detected disk, partition numbers, current sizes, free space, selected
 The required workflow is:
 
 1. Run **Dry run**.
-2. If the proposed layout is correct, **restart Windows**.
-3. Run `Move-WinRE-And-Extend.bat` again and choose **Execute**.
-4. Select the desired Recovery size again and type:
+2. If the proposed layout is correct, run `Move-WinRE-And-Extend.bat` again and choose **Execute**. A reboot between Dry run and Execute is not required merely because BitLocker is disabled.
+3. Select the desired Recovery size again and type:
 
    ```text
    RELAYOUT
    ```
 
-5. When Execute finishes the partition changes, **restart Windows again**. An immediate same-session `reagentc /info` may still report WinRE as Disabled even when `reagentc /enable` returned success; this is treated as pending post-reboot validation rather than a partition-operation failure.
-6. Run `Move-WinRE-And-Extend.bat` again and choose **WinRE confirmation / recovery**.
-7. The operation is considered complete only when the post-reboot check reports:
+4. When Execute finishes the partition changes, **restart Windows**. This restart is retained for post-reboot WinRE/BCD/disk validation even when BitLocker is fully disabled. An immediate same-session `reagentc /info` may still report WinRE as Disabled even when `reagentc /enable` returned success; this is treated as pending post-reboot validation rather than a partition-operation failure.
+5. Run `Move-WinRE-And-Extend.bat` again and choose **WinRE confirmation / recovery**.
+6. The operation is considered complete only when the post-reboot check reports:
 
    ```text
    FINAL DISK / WINRE STATE CONFIRMED
@@ -310,36 +311,32 @@ Use `-Force` only after validating the same machine/layout with a dry-run.
 
 ## BitLocker
 
-The script now distinguishes between **encryption state** and **protection state**. This matters because a BitLocker volume can remain fully encrypted while `ProtectionStatus` is `Off`, which means its key protectors are suspended rather than the volume being decrypted.
+The script treats **conversion state** and **protection state** separately. Microsoft documents the conversion states as `FullyDecrypted`, `FullyEncrypted`, `EncryptionInProgress`, `DecryptionInProgress`, `EncryptionPaused`, and `DecryptionPaused`; the conversion state is authoritative for whether the volume is actually fully decrypted or fully encrypted.
 
-Dry run reports:
+The utility classifies them as:
 
-- volume status, such as `FullyEncrypted`;
-- protection status, `On` or `Off`;
-- lock status;
-- encryption percentage;
-- configured key-protector count and protector types when available.
+- `FullyDecrypted` -> **Disabled**: BitLocker is intentionally off. The script leaves it off, does not add protectors, does not call `Resume-BitLocker`, and does not call `Suspend-BitLocker`.
+- `FullyEncrypted` + protection `On` -> **Protected**: normal BitLocker state. Execute uses the controlled one-reboot suspension immediately before partition changes.
+- `FullyEncrypted` + protection `Off` -> **Suspended**: an encrypted but unprotected/intermediate state. Execute attempts to resume protection before `RELAYOUT`; post-reboot confirmation may also attempt resume.
+- `DecryptionInProgress` / `DecryptionPaused` -> **Disabling**: Execute is blocked until the volume reaches `FullyDecrypted`. The script explicitly does not reverse the user's request to disable BitLocker.
+- `EncryptionInProgress` / `EncryptionPaused` -> **Enabling**: Execute is blocked until conversion reaches a stable state.
+- anything else -> **Unknown**: Execute stops rather than guessing.
 
-If an encrypted OS volume has no configured key protectors, Execute refuses to modify partitions. Post-reboot confirmation also reports that condition explicitly instead of repeatedly attempting `Resume-BitLocker`.
+Dry run reports the raw `VolumeStatus`, `ProtectionStatus`, lifecycle classification, lock status, encryption percentage, and protector metadata when relevant.
 
-Execute first verifies that an encrypted OS volume can be returned to protected state. If protection is currently `Off`, the script attempts `Resume-BitLocker` **before** it asks for `RELAYOUT`. If that resume fails, Execute reports **BITLOCKER READINESS FAILED**, returns exit code `2`, and stops before the confirmation and before any disk-layout change.
+If BitLocker is fully disabled (`VolumeStatus = FullyDecrypted`), no BitLocker-specific restart is required and the script leaves it disabled. The **post-Execute restart is still required by this project** for WinRE/BCD/disk post-reboot validation; it is not there solely to resume BitLocker.
 
-Only after BitLocker readiness passes and the user confirms `RELAYOUT` is the encrypted OS volume placed into a known one-reboot BitLocker suspension using:
+If a fully encrypted OS volume is suspended, Execute first verifies that it can return to protected state. If resume fails, Execute reports **BITLOCKER READINESS FAILED**, returns exit code `2`, and stops before `RELAYOUT` or any disk-layout change.
+
+Only after readiness passes and the user confirms `RELAYOUT` is a protected BitLocker volume suspended for one reboot:
 
 ```powershell
 Suspend-BitLocker -MountPoint 'C:' -RebootCount 1
 ```
 
-If protection was already suspended before Execute, the readiness phase resumes it and verifies that protection is `On`. If the user then confirms the operation, the script establishes the controlled one-reboot suspension. This avoids carrying an unknown or indefinite suspension forward from an earlier interrupted attempt; if the user cancels after readiness succeeds, BitLocker remains protected.
+If readiness fails in the specific recoverable suspended state where a **RecoveryPassword** protector is retained, no TPM-based protector exists, and the TPM is healthy, interactive Execute may offer the explicit `ADDTPM` repair. It preserves the RecoveryPassword protector, adds one TPM protector, retries resume, and removes only the newly-created TPM protector if that repair fails. `-Force` never performs this protector-topology repair automatically.
 
-If BitLocker readiness fails, the script prints non-secret diagnostics: key-protector **types and IDs** plus TPM availability/readiness when `Get-Tpm` is available. It deliberately does not print the 48-digit recovery password.
-
-When readiness fails in the specific recoverable state where the OS volume is encrypted and suspended, a **RecoveryPassword** protector is still present, no TPM-based protector exists, and the TPM is present/ready/enabled/activated/not locked out, interactive Execute may offer an explicit `ADDTPM` repair. That repair adds a TPM-only protector while retaining the RecoveryPassword protector, then retries `Resume-BitLocker`. If resume still fails, the script removes only the TPM protector created by that repair attempt. `-Force` never performs this protector-topology repair automatically. Windows policy remains authoritative: if TPM-only startup protection is not allowed, the protector add fails and Execute stops before `RELAYOUT`.
-
-After the required restart, **WinRE confirmation / recovery** checks BitLocker again. If the OS volume remains encrypted but protection is still `Off`, it attempts `Resume-BitLocker`. Final confirmation does not pass while an encrypted OS volume remains suspended.
-
-Microsoft documents that suspending BitLocker does not decrypt the volume; it temporarily makes the volume encryption key available, and `-RebootCount 1` schedules protection to resume after the next restart.
-
+Microsoft documents that `Disable-BitLocker` removes key protectors and starts decryption. The utility therefore treats an in-progress user-requested decryption as **Disabling**, not as a suspended volume that should be resumed.
 ## Recovery backup
 
 Before deleting the old Recovery partition, the script disables WinRE and verifies that Windows has made `Winre.wim` available.
