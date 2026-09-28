@@ -618,8 +618,24 @@ function Invoke-BitLockerTpmReadinessRepair {
     catch {
         $repairFailure = $_.Exception.Message
 
+        try {
+            $current = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+            $discoveredNewTpmIds = @(
+                $current.KeyProtector |
+                    Where-Object {
+                        ("$($_.KeyProtectorType)" -eq 'Tpm') -and
+                        ($beforeIds -notcontains "$($_.KeyProtectorId)")
+                    } |
+                    ForEach-Object { "$($_.KeyProtectorId)" }
+            )
+            $newProtectorIds = @($newProtectorIds + $discoveredNewTpmIds | Select-Object -Unique)
+        }
+        catch {
+            Write-Warning ("Could not re-enumerate protectors during TPM repair rollback: {0}" -f $_.Exception.Message)
+        }
+
         if ($newProtectorIds.Count -gt 0) {
-            Write-Warning 'BitLocker readiness repair did not complete. Removing only the TPM protector added by this repair attempt.'
+            Write-Warning 'BitLocker readiness repair did not complete. Removing only TPM protectors added by this repair attempt.'
             foreach ($newId in $newProtectorIds) {
                 try {
                     Remove-BitLockerKeyProtector -MountPoint $mountPoint -KeyProtectorId $newId -Confirm:$false -ErrorAction Stop | Out-Null
@@ -1561,6 +1577,7 @@ if ($bitLockerBlocksExecute) {
 }
 
 Write-Step 'Checking BitLocker readiness before RELAYOUT confirmation'
+$bitLockerReadyState = $null
 try {
     $bitLockerReadyState = Ensure-BitLockerProtectedForExecute -DriveLetter $osLetter
 }
