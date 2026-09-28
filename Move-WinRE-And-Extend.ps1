@@ -303,7 +303,7 @@ function Backup-ActiveWinREImage {
             -Purpose 'pre-disable Winre.wim rollback backup'
 
         Write-Host ("Active WinRE image:       {0}" -f $sourcePath)
-        Write-Host ("Active WinRE image size:  {0}" -f (Format-Bytes ([uint64]$sourceItem.Length))
+        Write-Host ("Active WinRE image size:  {0}" -f (Format-Bytes ([uint64]$sourceItem.Length)))
         Write-Host ("Free space before backup: {0}" -f (Format-Bytes $space.FreeBytes))
         Write-Host ("Backup copy requirement:  {0}" -f (Format-Bytes $space.RequiredBytes))
 
