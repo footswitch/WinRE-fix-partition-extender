@@ -67,6 +67,7 @@ $ErrorActionPreference = 'Stop'
 $MiB = [uint64](1MB)
 $RecoveryGptType = '{de94bba4-06d1-4d40-a16a-bfd50179d6ac}'
 $RecoveryGptTypeBare = 'de94bba4-06d1-4d40-a16a-bfd50179d6ac'
+$RecoveryGptAttributes = [Convert]::ToUInt64('8000000000000001', 16)
 
 function Write-Step([string]$Text) {
     Write-Host "`n==> $Text" -ForegroundColor Cyan
@@ -174,6 +175,45 @@ function Invoke-DiskPartScript {
     }
 }
 
+function Get-GptPartitionAttributes {
+    param(
+        [Parameter(Mandatory)] [int]$DiskNumber,
+        [Parameter(Mandatory)] [int]$PartitionNumber
+    )
+
+    $tmp = Join-Path $env:TEMP ("winre-diskpart-detail-{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    try {
+        @(
+            "select disk $DiskNumber"
+            "select partition $PartitionNumber"
+            'detail partition'
+            'exit'
+        ) | Set-Content -LiteralPath $tmp -Encoding ASCII
+
+        $output = & "$env:SystemRoot\System32\diskpart.exe" /s $tmp 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            throw "DiskPart detail partition failed with exit code $exitCode."
+        }
+
+        $outputText = ($output -join "`n")
+        $attributeMatch = [regex]::Match($outputText, '(?i)\b0x(?<hex>[0-9a-f]{16})\b')
+        if (-not $attributeMatch.Success) {
+            throw "Could not parse the raw GPT attribute field for disk $DiskNumber partition $PartitionNumber from DiskPart detail partition output."
+        }
+
+        return [Convert]::ToUInt64($attributeMatch.Groups['hex'].Value, 16)
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Format-GptAttributes {
+    param([uint64]$Attributes)
+    return ('0x{0:X16}' -f $Attributes)
+}
+
 function Set-And-VerifyRecoveryPartitionMetadata {
     param(
         [Parameter(Mandatory)] [int]$DiskNumber,
@@ -188,29 +228,24 @@ function Set-And-VerifyRecoveryPartitionMetadata {
         'exit'
     )
 
-    Set-Partition `
-        -DiskNumber $DiskNumber `
-        -PartitionNumber $PartitionNumber `
-        -NoDefaultDriveLetter $true `
-        -ErrorAction Stop
-
     Start-Sleep -Milliseconds 500
     $partition = Get-Partition -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
     $typeOk = "$($partition.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
+    $rawAttributes = Get-GptPartitionAttributes -DiskNumber $DiskNumber -PartitionNumber $PartitionNumber
 
     if (-not $typeOk) {
         throw "Recovery partition $PartitionNumber does not have the Microsoft Recovery GPT type after metadata finalization."
     }
-    if (-not $partition.NoDefaultDriveLetter) {
-        throw "Recovery partition $PartitionNumber still does not have NoDefaultDriveLetter=True after metadata finalization."
+    if ($rawAttributes -ne $RecoveryGptAttributes) {
+        throw ("Recovery partition {0} raw GPT attributes are {1}; expected {2}." -f $PartitionNumber, (Format-GptAttributes $rawAttributes), (Format-GptAttributes $RecoveryGptAttributes))
     }
     if ($partition.DriveLetter) {
         throw "Recovery partition $PartitionNumber still has drive letter $($partition.DriveLetter): after metadata finalization."
     }
 
+    Write-Host ("Verified Recovery GPT attributes: {0}" -f (Format-GptAttributes $rawAttributes))
     return $partition
 }
-
 function Get-WinRELocation {
     param([string]$InfoOutput)
 
@@ -910,8 +945,9 @@ function Invoke-WinRERollback {
     $sizeDifference = [math]::Abs([int64]$finalRecovery.Size - [int64]$OriginalRecoverySize)
     $typeOk = "$($finalRecovery.GptType)".Trim('{}').ToLowerInvariant() -eq $RecoveryGptTypeBare
 
-    if (($sizeDifference -gt 1MB) -or (-not $typeOk) -or $finalRecovery.DriveLetter -or (-not $finalRecovery.NoDefaultDriveLetter)) {
-        throw 'Rollback recreated a Recovery partition, but its final size, GPT type, drive-letter state, or NoDefaultDriveLetter attribute does not match the intended Recovery layout.'
+    $rollbackRawAttributes = Get-GptPartitionAttributes -DiskNumber $DiskNumber -PartitionNumber $finalRecovery.PartitionNumber
+    if (($sizeDifference -gt 1MB) -or (-not $typeOk) -or $finalRecovery.DriveLetter -or ($rollbackRawAttributes -ne $RecoveryGptAttributes)) {
+        throw 'Rollback recreated a Recovery partition, but its final size, GPT type, drive-letter state, or raw GPT attributes do not match the intended Recovery layout.'
     }
 
     Write-Host ''
@@ -1026,8 +1062,18 @@ function Invoke-WinREConfirmationRecovery {
             if (-not $registeredPartition.IsHidden) {
                 $layoutIssues += 'The WinRE partition is not marked hidden.'
             }
-            if (-not $registeredPartition.NoDefaultDriveLetter) {
-                $layoutIssues += 'The WinRE partition does not have the no-default-drive-letter attribute.'
+            try {
+                $registeredRawAttributes = Get-GptPartitionAttributes `
+                    -DiskNumber $registeredDisk `
+                    -PartitionNumber $registeredPartitionNumber
+                if ($registeredRawAttributes -ne $RecoveryGptAttributes) {
+                    $layoutIssues += ("The WinRE partition raw GPT attributes are {0}; expected {1}." -f `
+                        (Format-GptAttributes $registeredRawAttributes),
+                        (Format-GptAttributes $RecoveryGptAttributes))
+                }
+            }
+            catch {
+                $layoutIssues += ("The WinRE partition raw GPT attributes could not be verified: {0}" -f $_.Exception.Message)
             }
             if (($null -eq $registeredVolume) -or ("$($registeredVolume.FileSystem)" -ne 'NTFS')) {
                 $layoutIssues += 'The WinRE partition filesystem could not be confirmed as NTFS.'
@@ -1044,7 +1090,7 @@ function Invoke-WinREConfirmationRecovery {
                 Write-Host ("Recovery size:         {0} MB" -f $sizeMB)
                 Write-Host 'Recovery filesystem:   NTFS'
                 Write-Host 'Recovery drive letter: none'
-                Write-Host 'Recovery attributes:   hidden + no-default-drive-letter'
+                Write-Host 'Recovery attributes:   hidden + GPT 0x8000000000000001'
                 Write-Host 'Partition placement:   immediately after C: and last on disk'
                 if ($bitLockerFinal.State.Available) {
                     if ($bitLockerFinal.State.IsEncrypted) {
@@ -1063,16 +1109,16 @@ function Invoke-WinREConfirmationRecovery {
                 Write-Warning ("  - {0}" -f $issue)
             }
 
-            $onlyNoDefaultDriveLetterMissing = (
+            $onlyRecoveryGptAttributesWrong = (
                 ($layoutIssues.Count -eq 1) -and
-                ($layoutIssues[0] -eq 'The WinRE partition does not have the no-default-drive-letter attribute.')
+                ($layoutIssues[0] -like 'The WinRE partition raw GPT attributes are*')
             )
 
-            if ($onlyNoDefaultDriveLetterMissing) {
+            if ($onlyRecoveryGptAttributesWrong) {
                 Write-Host ''
                 Write-Host 'METADATA-ONLY WINRE REPAIR AVAILABLE' -ForegroundColor Yellow
                 Write-Host 'WinRE registration, partition size, filesystem, placement, and BitLocker state are already correct.'
-                Write-Host 'Only the NoDefaultDriveLetter metadata attribute needs normalization.'
+                Write-Host 'Only the raw Recovery GPT attribute field needs normalization.'
                 Write-Host 'No Winre.wim copy or REAgentC registration reset is required.'
 
                 if (-not $Force) {
@@ -1103,8 +1149,9 @@ function Invoke-WinREConfirmationRecovery {
                 }
 
                 $registeredPartition = Get-Partition -DiskNumber $registeredDisk -PartitionNumber $registeredPartitionNumber
-                if ($registeredPartition.DriveLetter -or (-not $registeredPartition.NoDefaultDriveLetter) -or (-not $registeredPartition.IsHidden)) {
-                    throw 'Metadata-only repair did not produce the expected hidden/no-default-drive-letter Recovery state.'
+                $registeredRawAttributes = Get-GptPartitionAttributes -DiskNumber $registeredDisk -PartitionNumber $registeredPartitionNumber
+                if ($registeredPartition.DriveLetter -or (-not $registeredPartition.IsHidden) -or ($registeredRawAttributes -ne $RecoveryGptAttributes)) {
+                    throw 'Metadata-only repair did not produce the expected hidden/no-drive-letter Recovery GPT state.'
                 }
 
                 Write-Host ''
@@ -1114,7 +1161,7 @@ function Invoke-WinREConfirmationRecovery {
                 Write-Host ("Recovery size:         {0} MB" -f $sizeMB)
                 Write-Host 'Recovery filesystem:   NTFS'
                 Write-Host 'Recovery drive letter: none'
-                Write-Host 'Recovery attributes:   hidden + no-default-drive-letter'
+                Write-Host 'Recovery attributes:   hidden + GPT 0x8000000000000001'
                 Write-Host 'Partition placement:   immediately after C: and last on disk'
                 if ($bitLockerFinal.State.Available -and $bitLockerFinal.State.IsEncrypted) {
                     Write-Host ("BitLocker protection:  {0}" -f $bitLockerFinal.State.ProtectionStatus)
@@ -2012,8 +2059,11 @@ try {
     if ($finalRecovery.DriveLetter) {
         throw "Final Recovery partition unexpectedly has drive letter $($finalRecovery.DriveLetter):."
     }
-    if (-not $finalRecovery.NoDefaultDriveLetter) {
-        throw 'Final Recovery partition does not have NoDefaultDriveLetter=True.'
+    $finalRawAttributes = Get-GptPartitionAttributes -DiskNumber $disk.Number -PartitionNumber $finalRecovery.PartitionNumber
+    if ($finalRawAttributes -ne $RecoveryGptAttributes) {
+        throw ("Final Recovery partition raw GPT attributes are {0}; expected {1}." -f `
+            (Format-GptAttributes $finalRawAttributes),
+            (Format-GptAttributes $RecoveryGptAttributes))
     }
     if (-not $finalRecovery.IsHidden) {
         throw 'Final Recovery partition is not reported as hidden.'
