@@ -1062,6 +1062,67 @@ function Invoke-WinREConfirmationRecovery {
             foreach ($issue in $layoutIssues) {
                 Write-Warning ("  - {0}" -f $issue)
             }
+
+            $onlyNoDefaultDriveLetterMissing = (
+                ($layoutIssues.Count -eq 1) -and
+                ($layoutIssues[0] -eq 'The WinRE partition does not have the no-default-drive-letter attribute.')
+            )
+
+            if ($onlyNoDefaultDriveLetterMissing) {
+                Write-Host ''
+                Write-Host 'METADATA-ONLY WINRE REPAIR AVAILABLE' -ForegroundColor Yellow
+                Write-Host 'WinRE registration, partition size, filesystem, placement, and BitLocker state are already correct.'
+                Write-Host 'Only the NoDefaultDriveLetter metadata attribute needs normalization.'
+                Write-Host 'No Winre.wim copy or REAgentC registration reset is required.'
+
+                if (-not $Force) {
+                    $metadataConfirmation = Read-Host 'Type RECOVER to normalize only the Recovery partition metadata, or anything else to cancel'
+                    if ($metadataConfirmation -cne 'RECOVER') {
+                        Write-Host 'Cancelled. No recovery changes were made.'
+                        return
+                    }
+                }
+
+                $registeredPartition = Set-And-VerifyRecoveryPartitionMetadata `
+                    -DiskNumber $registeredDisk `
+                    -PartitionNumber $registeredPartitionNumber
+
+                $postMetadataInfo = Invoke-ReAgentC -Arguments @('/info')
+                $postMetadataLocation = [regex]::Match($postMetadataInfo.Output, $locationPattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                $postMetadataEnabled = $postMetadataInfo.Output -match '(?im)Windows RE status:\s*Enabled'
+
+                if (-not $postMetadataEnabled -or -not $postMetadataLocation.Success) {
+                    throw 'Metadata-only repair completed, but WinRE registration could not be re-verified.'
+                }
+
+                if (
+                    ([int]$postMetadataLocation.Groups['disk'].Value -ne $registeredDisk) -or
+                    ([int]$postMetadataLocation.Groups['partition'].Value -ne $registeredPartitionNumber)
+                ) {
+                    throw 'Metadata-only repair completed, but WinRE registration points to an unexpected partition.'
+                }
+
+                $registeredPartition = Get-Partition -DiskNumber $registeredDisk -PartitionNumber $registeredPartitionNumber
+                if ($registeredPartition.DriveLetter -or (-not $registeredPartition.NoDefaultDriveLetter) -or (-not $registeredPartition.IsHidden)) {
+                    throw 'Metadata-only repair did not produce the expected hidden/no-default-drive-letter Recovery state.'
+                }
+
+                Write-Host ''
+                Write-Host 'FINAL DISK / WINRE STATE CONFIRMED' -ForegroundColor Green
+                Write-Host 'WinRE status:          Enabled'
+                Write-Host ("WinRE location:        disk {0}, partition {1}" -f $registeredDisk, $registeredPartitionNumber)
+                Write-Host ("Recovery size:         {0} MB" -f $sizeMB)
+                Write-Host 'Recovery filesystem:   NTFS'
+                Write-Host 'Recovery drive letter: none'
+                Write-Host 'Recovery attributes:   hidden + no-default-drive-letter'
+                Write-Host 'Partition placement:   immediately after C: and last on disk'
+                if ($bitLockerFinal.State.Available -and $bitLockerFinal.State.IsEncrypted) {
+                    Write-Host ("BitLocker protection:  {0}" -f $bitLockerFinal.State.ProtectionStatus)
+                }
+                Write-Host ''
+                Write-Host 'The metadata-only repair and final validation passed. The relayout operation is complete.' -ForegroundColor Green
+                return
+            }
         }
 
         Write-Warning 'WinRE confirmation did not pass all final-state checks.'
