@@ -238,6 +238,8 @@ The mode first checks the current WinRE status and validates the final disk stat
 
 Recovery metadata finalization now applies Microsoft's documented `0x8000000000000001` GPT attributes and also sets `NoDefaultDriveLetter=True` through the Windows Storage provider. Execute, recovery mode, and rollback then re-read the partition and fail if the Microsoft Recovery GPT type, no-current-drive-letter state, or `NoDefaultDriveLetter` invariant is missing. This closes a case where DiskPart returned success but the no-default-drive-letter state was not actually present.
 
+If **the only** failed final-state check is `NoDefaultDriveLetter=False` while WinRE registration, filesystem, size, placement, hidden state, and BitLocker are already correct, option 3 uses a metadata-only `RECOVER` path. It normalizes and verifies the Recovery partition metadata without copying `Winre.wim`, clearing REAgentC metadata, or re-registering WinRE.
+
 If recovery is required, it displays the detected OS disk, Recovery partition, WinRE image source and sizes, then requires the user to type:
 
 ```text
