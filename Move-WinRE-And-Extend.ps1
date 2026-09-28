@@ -475,6 +475,165 @@ function Write-BitLockerReadinessDiagnostics {
         Write-Host '  TPM status: Get-Tpm is not available on this system.'
     }
 }
+function Get-BitLockerTpmRepairAssessment {
+    param([char]$DriveLetter)
+
+    $state = Get-BitLockerState -DriveLetter $DriveLetter
+    $mountPoint = ("{0}:" -f $DriveLetter)
+
+    $result = [ordered]@{
+        CanOffer            = $false
+        Reason              = $null
+        State               = $state
+        HasRecoveryPassword = $false
+        HasTpmProtector     = $false
+        TpmPresent          = $false
+        TpmReady            = $false
+        TpmEnabled          = $false
+        TpmActivated        = $false
+        TpmLockedOut        = $null
+    }
+
+    if (-not $state.Available) {
+        $result.Reason = 'BitLocker state is not available.'
+        return [pscustomobject]$result
+    }
+
+    if (-not $state.IsEncrypted) {
+        $result.Reason = 'The OS volume is not BitLocker-encrypted.'
+        return [pscustomobject]$result
+    }
+
+    if ($state.ProtectionStatus -ne 'Off') {
+        $result.Reason = 'BitLocker protection is not suspended.'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $bl = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+        $protectors = @($bl.KeyProtector)
+    }
+    catch {
+        $result.Reason = "Could not enumerate BitLocker key protectors: $($_.Exception.Message)"
+        return [pscustomobject]$result
+    }
+
+    $result.HasRecoveryPassword = @($protectors | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' }).Count -gt 0
+    $result.HasTpmProtector = @($protectors | Where-Object { "$($_.KeyProtectorType)" -match '^Tpm' }).Count -gt 0
+
+    if (-not $result.HasRecoveryPassword) {
+        $result.Reason = 'No RecoveryPassword protector is present. The script will not change startup protectors without a retained recovery method.'
+        return [pscustomobject]$result
+    }
+
+    if ($result.HasTpmProtector) {
+        $result.Reason = 'A TPM-based protector already exists, so adding another TPM protector would be ambiguous.'
+        return [pscustomobject]$result
+    }
+
+    $getTpm = Get-Command Get-Tpm -ErrorAction SilentlyContinue
+    if (-not $getTpm) {
+        $result.Reason = 'Get-Tpm is not available.'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $tpm = Get-Tpm -ErrorAction Stop
+    }
+    catch {
+        $result.Reason = "Could not query TPM state: $($_.Exception.Message)"
+        return [pscustomobject]$result
+    }
+
+    $result.TpmPresent = [bool]$tpm.TpmPresent
+    $result.TpmReady = [bool]$tpm.TpmReady
+    $result.TpmEnabled = [bool]$tpm.TpmEnabled
+    $result.TpmActivated = [bool]$tpm.TpmActivated
+    $result.TpmLockedOut = [bool]$tpm.LockedOut
+
+    if (-not ($result.TpmPresent -and $result.TpmReady -and $result.TpmEnabled -and $result.TpmActivated) -or $result.TpmLockedOut) {
+        $result.Reason = 'TPM is not in a healthy state for a TPM-only BitLocker protector.'
+        return [pscustomobject]$result
+    }
+
+    $result.CanOffer = $true
+    $result.Reason = 'A retained RecoveryPassword exists, no TPM-based protector exists, and the TPM is healthy.'
+    return [pscustomobject]$result
+}
+
+function Invoke-BitLockerTpmReadinessRepair {
+    param([char]$DriveLetter)
+
+    $assessment = Get-BitLockerTpmRepairAssessment -DriveLetter $DriveLetter
+    if (-not $assessment.CanOffer) {
+        throw "TPM protector repair is not safe to offer: $($assessment.Reason)"
+    }
+
+    $mountPoint = ("{0}:" -f $DriveLetter)
+    $before = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+    $beforeIds = @($before.KeyProtector | ForEach-Object { "$($_.KeyProtectorId)" })
+    $newProtectorIds = @()
+
+    Write-Step 'Adding a TPM protector while retaining the RecoveryPassword protector'
+    try {
+        Add-BitLockerKeyProtector -MountPoint $mountPoint -TpmProtector -Confirm:$false -ErrorAction Stop | Out-Null
+
+        Start-Sleep -Milliseconds 500
+        $afterAdd = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction Stop
+        $newProtectors = @(
+            $afterAdd.KeyProtector |
+                Where-Object {
+                    ("$($_.KeyProtectorType)" -eq 'Tpm') -and
+                    ($beforeIds -notcontains "$($_.KeyProtectorId)")
+                }
+        )
+        $newProtectorIds = @($newProtectors | ForEach-Object { "$($_.KeyProtectorId)" })
+
+        if ($newProtectorIds.Count -ne 1) {
+            throw "Expected exactly one newly added TPM protector, but found $($newProtectorIds.Count)."
+        }
+
+        $recoveryStillPresent = @($afterAdd.KeyProtector | Where-Object { "$($_.KeyProtectorType)" -eq 'RecoveryPassword' }).Count -gt 0
+        if (-not $recoveryStillPresent) {
+            throw 'The RecoveryPassword protector is no longer present after adding TPM protection.'
+        }
+
+        Write-Host ("Added TPM protector: {0}" -f $newProtectorIds[0]) -ForegroundColor Green
+        Write-Host 'Existing RecoveryPassword protector was retained.' -ForegroundColor Green
+
+        Write-Step 'Resuming BitLocker with the restored TPM startup protector'
+        Resume-BitLocker -MountPoint $mountPoint -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 500
+
+        $afterResume = Get-BitLockerState -DriveLetter $DriveLetter
+        Write-BitLockerState -State $afterResume -Prefix 'BitLocker after TPM repair'
+
+        if ((-not $afterResume.Available) -or ($afterResume.ProtectionStatus -ne 'On')) {
+            throw 'BitLocker protection did not return to On after adding the TPM protector.'
+        }
+
+        Write-Host 'BITLOCKER READINESS REPAIRED' -ForegroundColor Green
+        return $afterResume
+    }
+    catch {
+        $repairFailure = $_.Exception.Message
+
+        if ($newProtectorIds.Count -gt 0) {
+            Write-Warning 'BitLocker readiness repair did not complete. Removing only the TPM protector added by this repair attempt.'
+            foreach ($newId in $newProtectorIds) {
+                try {
+                    Remove-BitLockerKeyProtector -MountPoint $mountPoint -KeyProtectorId $newId -Confirm:$false -ErrorAction Stop | Out-Null
+                    Write-Host ("Removed temporary TPM protector: {0}" -f $newId)
+                }
+                catch {
+                    Write-Warning ("Could not remove newly added TPM protector {0}: {1}" -f $newId, $_.Exception.Message)
+                }
+            }
+        }
+
+        throw "TPM protector readiness repair failed: $repairFailure"
+    }
+}
 function Ensure-BitLockerProtectedForExecute {
     param([char]$DriveLetter)
 
@@ -1406,14 +1565,62 @@ try {
     $bitLockerReadyState = Ensure-BitLockerProtectedForExecute -DriveLetter $osLetter
 }
 catch {
+    $bitLockerReadinessFailure = $_.Exception.Message
+
     Write-Host ''
     Write-Host 'BITLOCKER READINESS FAILED' -ForegroundColor Red
-    Write-Warning $_.Exception.Message
+    Write-Warning $bitLockerReadinessFailure
     Write-BitLockerReadinessDiagnostics -DriveLetter $osLetter
-    Write-Host ''
-    Write-Host 'No RELAYOUT confirmation was requested.' -ForegroundColor Yellow
-    Write-Host 'No disk layout change was attempted.' -ForegroundColor Yellow
-    exit 2
+
+    $tpmRepair = Get-BitLockerTpmRepairAssessment -DriveLetter $osLetter
+    if ($tpmRepair.CanOffer) {
+        Write-Host ''
+        Write-Host 'A conservative TPM protector repair is available.' -ForegroundColor Yellow
+        Write-Host 'It will:'
+        Write-Host '  - keep the existing RecoveryPassword protector;'
+        Write-Host '  - add one TPM-only startup protector;'
+        Write-Host '  - attempt to resume BitLocker protection;'
+        Write-Host '  - remove only that newly added TPM protector if resume still fails.'
+        Write-Host ''
+        Write-Host 'Windows policy remains authoritative; if TPM-only protection is disallowed, the add operation will fail and no relayout will start.'
+
+        if ($Force) {
+            Write-Warning 'Unattended -Force mode will not modify BitLocker protector topology.'
+        }
+        else {
+            $repairConfirmation = Read-Host 'Type ADDTPM to attempt this BitLocker readiness repair, or anything else to stop'
+            if ($repairConfirmation -ceq 'ADDTPM') {
+                try {
+                    $bitLockerReadyState = Invoke-BitLockerTpmReadinessRepair -DriveLetter $osLetter
+                    Write-Host ''
+                    Write-Host 'BitLocker readiness now passes. RELAYOUT confirmation can continue.' -ForegroundColor Green
+                }
+                catch {
+                    Write-Host ''
+                    Write-Host 'BITLOCKER TPM REPAIR FAILED' -ForegroundColor Red
+                    Write-Warning $_.Exception.Message
+                    Write-BitLockerReadinessDiagnostics -DriveLetter $osLetter
+                    Write-Host ''
+                    Write-Host 'No RELAYOUT confirmation was requested.' -ForegroundColor Yellow
+                    Write-Host 'No disk layout change was attempted.' -ForegroundColor Yellow
+                    exit 2
+                }
+            }
+            else {
+                Write-Host 'BitLocker TPM repair was not authorized.' -ForegroundColor Yellow
+            }
+        }
+    }
+    else {
+        Write-Warning ("TPM protector repair was not offered: {0}" -f $tpmRepair.Reason)
+    }
+
+    if (($null -eq $bitLockerReadyState) -or ($bitLockerReadyState.ProtectionStatus -ne 'On')) {
+        Write-Host ''
+        Write-Host 'No RELAYOUT confirmation was requested.' -ForegroundColor Yellow
+        Write-Host 'No disk layout change was attempted.' -ForegroundColor Yellow
+        exit 2
+    }
 }
 
 if (-not $Force) {

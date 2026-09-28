@@ -330,6 +330,8 @@ If protection was already suspended before Execute, the readiness phase resumes 
 
 If BitLocker readiness fails, the script prints non-secret diagnostics: key-protector **types and IDs** plus TPM availability/readiness when `Get-Tpm` is available. It deliberately does not print the 48-digit recovery password.
 
+When readiness fails in the specific recoverable state where the OS volume is encrypted and suspended, a **RecoveryPassword** protector is still present, no TPM-based protector exists, and the TPM is present/ready/enabled/activated/not locked out, interactive Execute may offer an explicit `ADDTPM` repair. That repair adds a TPM-only protector while retaining the RecoveryPassword protector, then retries `Resume-BitLocker`. If resume still fails, the script removes only the TPM protector created by that repair attempt. `-Force` never performs this protector-topology repair automatically. Windows policy remains authoritative: if TPM-only startup protection is not allowed, the protector add fails and Execute stops before `RELAYOUT`.
+
 After the required restart, **WinRE confirmation / recovery** checks BitLocker again. If the OS volume remains encrypted but protection is still `Off`, it attempts `Resume-BitLocker`. Final confirmation does not pass while an encrypted OS volume remains suspended.
 
 Microsoft documents that suspending BitLocker does not decrypt the volume; it temporarily makes the volume encryption key available, and `-RebootCount 1` schedules protection to resume after the next restart.
