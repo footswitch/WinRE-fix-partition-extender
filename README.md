@@ -236,6 +236,8 @@ From the BAT launcher choose **WinRE confirmation / recovery**, or run:
 
 The mode first checks the current WinRE status and validates the final disk state: WinRE must be enabled on the expected Recovery GPT partition, the partition must be NTFS, hidden, have no default drive letter, be immediately after the Windows partition, be the last partition on the disk, and be within the expected **870–1100 MB** size range. If the OS volume is BitLocker-encrypted, protection must also be **On**; if it is still suspended, the mode attempts to resume it. When all checks pass it reports **FINAL DISK / WINRE STATE CONFIRMED**.
 
+Recovery metadata finalization now applies Microsoft's documented `0x8000000000000001` GPT attributes and also sets `NoDefaultDriveLetter=True` through the Windows Storage provider. Execute, recovery mode, and rollback then re-read the partition and fail if the Microsoft Recovery GPT type, no-current-drive-letter state, or `NoDefaultDriveLetter` invariant is missing. This closes a case where DiskPart returned success but the no-default-drive-letter state was not actually present.
+
 If recovery is required, it displays the detected OS disk, Recovery partition, WinRE image source and sizes, then requires the user to type:
 
 ```text
