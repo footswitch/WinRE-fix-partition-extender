@@ -2030,7 +2030,7 @@ $originalOSSize = [uint64]$osPartition.Size
 $originalRecoveryOffset = [uint64]$recoveryPartition.Offset
 $originalRecoverySize = [uint64]$recoveryPartition.Size
 $rollbackBackupWimPath = Join-Path $backupDir 'Winre.wim'
-$winreWasDisabledByExecution = $false
+$winreDisableAttemptedByExecution = $false
 $defaultStagedWinreWimPath = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
 
 try {
@@ -2090,8 +2090,8 @@ try {
         Clear-WinREImageLocationStagingMetadata -ReAgentXmlPath $reAgentXml | Out-Null
 
         Write-Step 'Disabling WinRE'
+        $winreDisableAttemptedByExecution = $true
         Invoke-ReAgentC -Arguments @('/disable') | Out-Null
-        $winreWasDisabledByExecution = $true
 
         $disabledInfo = Invoke-ReAgentC -Arguments @('/info') -AllowFailure
         $disabledStateConfirmed = `
@@ -2447,7 +2447,7 @@ catch {
     else {
         Write-Warning 'No partition-table change had occurred before the failure.'
 
-        if ($winreWasDisabledByExecution -and (Test-Path -LiteralPath $rollbackBackupWimPath)) {
+        if ($winreDisableAttemptedByExecution -and (Test-Path -LiteralPath $rollbackBackupWimPath)) {
             $stagedImageAccessible = $false
             try {
                 Get-Item -LiteralPath $defaultStagedWinreWimPath -Force -ErrorAction Stop | Out-Null
